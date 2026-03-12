@@ -141,6 +141,11 @@ football-analysis/
 │   ├── features.py        # Node and edge feature engineering
 │   └── models/            # GNN architectures (GCN, GAT, etc.)
 │
+├── scripts/
+│   ├── build_graphs.py              # Build .pt graph datasets from any Metrica game
+│   ├── train_team_classifier.py     # Experiment 1: in-game train/test
+│   └── cross_match_generalize.py    # Experiment 2: train Game 1, test Game 2
+│
 └── legacy/            # Earlier visualization and scraping work
     ├── statsbomb/
     ├── fbref/
@@ -173,27 +178,49 @@ y  possession outcome, formation class, pressing trigger, xG
 
 ## Results
 
-### Experiment 1 — Team Classifier (Metrica Sample Game 1)
-
-**Task:** Given a snapshot of all 22 players at the moment a pass occurs, predict which team is making the pass (Home=0, Away=1) — using spatial structure alone, no team identity in node features.
-
-**Data:** 799 pass-event graphs from Metrica Sample Game 1 · 437 Home / 362 Away · chronological 70/15/15 split
+**Setup:** Task is to predict which team is making the pass (Home=0, Away=1) from spatial structure alone — team identity flag removed from node features. Models must learn formation shape, field position, and velocity patterns to discriminate.
 
 **Node features:** `[x, y, vx, vy, dist_atk_goal, dist_def_goal, angle_atk, pressure]`
 **Edge features:** `[distance, Δx, Δy, same_team, pass_angle, vel_alignment]` · Delaunay triangulation
+
+---
+
+### Experiment 1 — In-Game Test (Game 1 train → Game 1 test)
+
+799 graphs · 437 Home / 362 Away · chronological 70/15/15 split
 
 | Model | Test Acc | Test AUC | Params |
 |---|---|---|---|
 | GCN (3-layer, hidden=64) | 0.868 | 0.998 | 11,009 |
 | **GAT (3-layer, hidden=32×4 heads, edge features)** | **1.000** | **1.000** | 46,433 |
 
-**Takeaway:** GCN learns formation shape and field position well enough for 86.8% accuracy without any team identifier. GAT achieves perfect separation by attending over edge features (pass direction, velocity alignment) — direct evidence that edge-level attention captures tactically meaningful player relationships.
+GCN reaches 86.8% from geometry alone. GAT achieves perfect separation — edge-level attention over pass direction and velocity alignment captures tactically meaningful player relationships that isotropic convolution misses.
+
+---
+
+### Experiment 2 — Cross-Match Generalization (Game 1 train → Game 2 test)
+
+Train: 640 graphs from Game 1 (first 80%) · Val: 159 graphs from Game 1 (last 20%) · **Test: 964 graphs from Game 2 — fully held-out, different match**
+
+| Model | Val Acc (G1) | Val AUC (G1) | **Test Acc (G2)** | **Test AUC (G2)** |
+|---|---|---|---|---|
+| **GCN** | 0.987 | 1.000 | **0.992** | **1.000** |
+| GAT | 0.912 | 1.000 | 0.940 | 1.000 |
+
+Both models generalize strongly to the unseen game. **GCN outperforms GAT on cross-match accuracy (99.2% vs 94.0%)** — the simpler neighbourhood aggregation learns a more transferable spatial signal, while GAT's richer edge attention captures Game 1-specific patterns that don't fully transfer.
+
+GCN on Game 2 — precision/recall by class:
+
+| Class | Precision | Recall | F1 |
+|---|---|---|---|
+| Home | 0.985 | 1.000 | 0.993 |
+| Away | 1.000 | 0.981 | 0.990 |
 
 ## Next Steps
 
-- [ ] **Cross-match generalization** — train on Game 1, test on Game 2 (same teams, different game)
+- [x] **Cross-match generalization** — train on Game 1, test on Game 2 ✓ GCN 99.2% / GAT 94.0%
 - [ ] **Harder label: possession loss** — predict whether possession is lost within the next 3 events (~94% base rate, requires oversampling)
-- [ ] **Attention weight visualization** — which player pairs does the GAT focus on for each prediction?
+- [ ] **Attention weight visualization** — which player pairs does the GAT focus on, and does it match known tactical patterns?
 - [ ] **StatsBomb 360 pipeline** — replicate with freeze-frame event graphs for broader match coverage
 - [ ] **Formation classifier** — cluster player position snapshots into tactical shapes (4-4-2, 4-3-3, etc.)
 

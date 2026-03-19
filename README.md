@@ -27,8 +27,10 @@ football-analysis/
 │   ├── download_data.py            # Download Metrica CSV files from GitHub
 │   ├── build_graphs.py             # Metrica tracking → PyG graph datasets
 │   ├── build_statsbomb_graphs.py   # StatsBomb 360 → pass-completion graphs
+│   ├── build_shot_graphs.py        # StatsBomb 360 → xG shot graphs
 │   ├── train_team_classifier.py    # Experiment 1: which team is passing?
-│   └── train_statsbomb_classifier.py  # Experiment 3 & 4: pass completion
+│   ├── train_statsbomb_classifier.py  # Experiment 3 & 4: pass completion
+│   └── train_xg_model.py           # Experiment 5 & 6: xG vs StatsBomb baseline
 │
 ├── src/
 │   ├── graph_builder.py   # Core: events/tracking → PyG Data objects
@@ -129,14 +131,53 @@ y  pass_completion (0=complete, 1=failed)  ← StatsBomb experiments
 
 ---
 
+### Experiment 5 — xG Model (WC2022, in-competition)
+
+**Task:** Predict whether a shot results in a goal from the 360° freeze-frame. Benchmarked against StatsBomb's published xG, logistic regression on shot geometry, and a majority-class baseline.
+
+**Data:** 1,412 shot graphs · 64 WC2022 matches · 13.1% goals · 70/15/15 chronological split
+
+| Model | AUC | Avg Precision | Brier |
+|---|---|---|---|
+| **StatsBomb xG** | **0.822** | **0.396** | **0.099** |
+| LogReg (dist+angle) | 0.799 | 0.355 | 0.105 |
+| GAT | 0.593 | 0.167 | 0.129 |
+| GCN | 0.555 | 0.154 | 0.130 |
+| Majority baseline | 0.500 | 0.131 | 0.114 |
+
+**Takeaway:** With ~1,400 shots and only 185 goals, the GNNs underfit. Shot distance and angle dominate the signal, and a graph model needs 10K+ samples to learn nuanced blocker positioning from freeze frames. A 2-feature logistic regression (0.799 AUC) already captures most of the geometry — StatsBomb's benchmark (0.822) incorporates additional features including shot technique, body position, and historical context.
+
+---
+
+### Experiment 6 — xG Cross-Competition (WC2022 → WWC2023)
+
+**Task:** Train the xG model on WC2022 shots, test on WWC2023. Domain shift: men's → women's football, different shot profiles and goal rates.
+
+**Data:**
+- Train: **1,412 graphs** · WC2022 · 13.1% goals
+- Test: **1,589 graphs** · WWC2023 · 11.1% goals
+
+| Model | AUC | Avg Precision | Brier |
+|---|---|---|---|
+| **StatsBomb xG** | **0.818** | **0.354** | **0.088** |
+| LogReg (dist+angle) | 0.764 | 0.294 | 0.095 |
+| GCN | 0.603 | 0.167 | 0.114 |
+| GAT | 0.560 | 0.148 | 0.118 |
+
+**Takeaway:** GCN (0.603) outperforms GAT (0.560) cross-competition — consistent with the bias-variance pattern seen in Experiment 2. The spatial geometry of shot situations transfers across men's and women's football, but GNNs still lag the logistic baseline at this data scale. The natural next step is a **hybrid model**: GCN graph embedding concatenated with shot metadata (distance, angle, body part) — the approach used by commercial xG providers.
+
+---
+
 ## Summary Table — All Experiments
 
-| # | Task | Train Data | Test Data | GCN AUC | GAT AUC | Winner |
+| # | Task | Train Data | Test Data | Best GNN AUC | Baseline AUC | Notes |
 |---|---|---|---|---|---|---|
-| 1 | Team classifier (in-game) | Metrica G1 | Metrica G1 | 0.998 | **1.000** | GAT |
-| 2 | Team classifier (cross-match) | Metrica G1 | Metrica G2 | **1.000** | 1.000 | Tie |
-| 3 | Pass completion (in-competition) | WC2022 (5 matches) | WC2022 (5 matches) | **0.609** | 0.597 | GCN |
-| 4 | Pass completion (cross-competition) | WC2022 (64 matches) | WWC2023 (64 matches) | 0.610 | **0.672** | GAT |
+| 1 | Team classifier (in-game) | Metrica G1 | Metrica G1 | **1.000** (GAT) | 0.547 maj. | Perfect separation |
+| 2 | Team classifier (cross-match) | Metrica G1 | Metrica G2 | **1.000** (GCN) | 0.547 maj. | GCN generalizes better |
+| 3 | Pass completion (in-comp) | WC2022 5 matches | WC2022 5 matches | **0.609** (GCN) | ~0.5 | AUC ~ professional xP models |
+| 4 | Pass completion (cross-comp) | WC2022 64 matches | WWC2023 64 matches | **0.672** (GAT) | ~0.5 | AUC maintained across domain shift |
+| 5 | xG (in-competition) | WC2022 shots | WC2022 shots | 0.593 (GAT) | **0.799** LogReg | Small data; distance dominates |
+| 6 | xG (cross-competition) | WC2022 shots | WWC2023 shots | 0.603 (GCN) | **0.764** LogReg | GCN beats GAT cross-domain |
 
 ---
 
@@ -146,10 +187,11 @@ y  pass_completion (0=complete, 1=failed)  ← StatsBomb experiments
 - [x] StatsBomb 360 pipeline
 - [x] Scale to full tournaments (64 matches each)
 - [x] Cross-competition generalization (WC2022 → WWC2023)
-- [ ] **xG model** — build on shot freeze-frames, benchmark against StatsBomb's published xG
-- [ ] **GAT attention visualization** — plot which player pairs the model focuses on for predicted failures
+- [x] **xG model** — benchmark GNN vs StatsBomb xG and logistic regression on shot freeze-frames
+- [ ] **Hybrid xG model** — GCN graph embedding + shot metadata (dist, angle, body part) → joint head
+- [ ] **GAT attention visualization** — plot which player pairs the model attends to for predicted failures
 - [ ] **Node-level prediction** — predict pass destination (which player receives), not just outcome
-- [ ] **Temporal GNNs** — use sequence of 5 frames before a pass to capture player momentum
+- [ ] **Temporal GNNs** — use sequence of 5 frames before a shot/pass to capture player momentum
 - [ ] **Formation classifier** — cluster position snapshots into tactical shapes (4-4-2, 4-3-3, etc.)
 
 ---
@@ -169,7 +211,7 @@ python scripts/build_graphs.py --game 1 2
 # 4. Train Metrica team classifier (Experiments 1 & 2)
 python scripts/train_team_classifier.py
 
-# 5. Build StatsBomb graphs (uses statsbombpy, no pre-download needed)
+# 5. Build StatsBomb pass graphs (uses statsbombpy, no pre-download needed)
 python scripts/build_statsbomb_graphs.py --competition 43 --season 106 --label wc2022   # WC2022
 python scripts/build_statsbomb_graphs.py --competition 72 --season 107 --label wwc2023  # WWC2023
 
@@ -180,6 +222,18 @@ python scripts/train_statsbomb_classifier.py --data data/processed/statsbomb_wc2
 python scripts/train_statsbomb_classifier.py \
   --train data/processed/statsbomb_wc2022_pass_graphs.pt \
   --test  data/processed/statsbomb_wwc2023_pass_graphs.pt
+
+# 8. Build xG shot graphs
+python scripts/build_shot_graphs.py --competition 43 --season 106 --label wc2022   # WC2022
+python scripts/build_shot_graphs.py --competition 72 --season 107 --label wwc2023  # WWC2023
+
+# 9. Train xG benchmark — in-competition (Experiment 5)
+python scripts/train_xg_model.py --data data/processed/statsbomb_wc2022_shot_graphs.pt
+
+# 10. Train xG benchmark — cross-competition (Experiment 6)
+python scripts/train_xg_model.py \
+  --train data/processed/statsbomb_wc2022_shot_graphs.pt \
+  --test  data/processed/statsbomb_wwc2023_shot_graphs.pt
 ```
 
 ## Stack

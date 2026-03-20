@@ -32,6 +32,8 @@ REPO_ROOT = Path(__file__).parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from src.features import TECHNIQUE_INDEX, NUM_TECHNIQUES
+from src.models.hybrid_gat import HybridGATModel
+from src.calibration import TemperatureScaler
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -61,9 +63,12 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-PROCESSED  = REPO_ROOT / "data" / "processed"
-MODEL_PATH = PROCESSED / "pool_7comp_hybrid_xg.pt"
-META_DIM   = 12  # shot_dist, shot_angle, is_header, is_open_play + technique (8-dim one-hot)
+PROCESSED      = REPO_ROOT / "data" / "processed"
+MODEL_PATH     = PROCESSED / "pool_7comp_hybrid_xg.pt"
+TEMP_PATH      = PROCESSED / "pool_7comp_T.pt"          # GCN temperature scalar
+GAT_MODEL_PATH = PROCESSED / "pool_7comp_hybrid_gat_xg.pt"
+GAT_TEMP_PATH  = PROCESSED / "pool_7comp_gat_T.pt"      # GAT temperature scalar
+META_DIM       = 12  # shot_dist, shot_angle, is_header, is_open_play + technique (8-dim one-hot)
 
 # Technique index → display name
 TECHNIQUE_NAMES: dict[int, str] = {v: k.title() for k, v in TECHNIQUE_INDEX.items()}
@@ -147,13 +152,89 @@ def compute_node_saliency(model, graph):
     return importance
 
 
+# ── GAT attention extraction ──────────────────────────────────────────────────
+def compute_gat_attention(gat_model, graph) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    Run forward_with_attention on a single graph using the HybridGATModel.
+
+    Returns
+    -------
+    edge_index : (2, E) int array — src/dst node indices
+    alpha      : (E,) float array — scalar importance per directed edge
+                 (mean across heads and layers; softmax-normalised within-graph)
+    Returns None if GAT model is not available.
+    """
+    if gat_model is None:
+        return None
+
+    # The gat_model is TemperatureScaler-wrapped; access the inner HybridGATModel
+    inner = gat_model.model if isinstance(gat_model, TemperatureScaler) else gat_model
+
+    inner.eval()
+    x        = graph.x.clone().detach().float()
+    ei       = graph.edge_index
+    batch_v  = torch.zeros(graph.x.shape[0], dtype=torch.long)
+    meta     = torch.cat([
+        torch.tensor([[
+            float(graph.shot_dist.item()),
+            float(graph.shot_angle.item()),
+            float(graph.is_header.item()),
+            float(graph.is_open_play.item()),
+        ]]),
+        graph.technique.unsqueeze(0),   # [1, 8]
+    ], dim=1)                           # [1, 12]
+
+    with torch.no_grad():
+        _, alphas = inner.forward_with_attention(x, ei, batch_v, meta)
+
+    # alphas: list of (E, heads) tensors — one per layer
+    # Aggregate: mean over layers, mean over heads → (E,)
+    alpha_stack = torch.stack(alphas)           # (n_layers, E, heads)
+    alpha_E     = alpha_stack.mean(0).mean(-1)  # (E,)
+    alpha_E     = alpha_E.cpu().numpy()
+
+    return graph.edge_index.numpy(), alpha_E
+
+
 # ── Cached loaders ────────────────────────────────────────────────────────────
 @st.cache_resource
 def load_model():
-    model = HybridXGModel()
-    model.load_state_dict(torch.load(MODEL_PATH, weights_only=True, map_location="cpu"))
-    model.eval()
-    return model
+    """Load HybridGCN + temperature scalar. Returns TemperatureScaler-wrapped model."""
+    base = HybridXGModel()
+    base.load_state_dict(torch.load(MODEL_PATH, weights_only=True, map_location="cpu"))
+    base.eval()
+    # Wrap with temperature scaler (falls back to T=1.0 if no T file yet)
+    scaler = TemperatureScaler.load(base, TEMP_PATH)
+    scaler.eval()
+    return scaler
+
+
+@st.cache_resource
+def load_gat_model():
+    """
+    Load HybridGATModel + temperature scalar.
+    Returns (model, available:bool).
+    """
+    if not GAT_MODEL_PATH.exists():
+        return None, False
+    try:
+        # Infer node_in from the saved state dict
+        ckpt = torch.load(GAT_MODEL_PATH, weights_only=True, map_location="cpu")
+        # convs.0.lin_l.weight shape = (heads*hidden, node_in)
+        node_in = ckpt["convs.0.lin_l.weight"].shape[1]
+        # edge_dim: convs.0.lin_edge exists only when edge_dim > 0
+        edge_dim = (ckpt["convs.0.lin_edge.weight"].shape[1]
+                    if "convs.0.lin_edge.weight" in ckpt else 0)
+        gat = HybridGATModel(node_in=node_in, edge_dim=edge_dim,
+                             meta_dim=META_DIM, hidden=32, heads=4,
+                             n_layers=3, dropout=0.3)
+        gat.load_state_dict(ckpt)
+        gat.eval()
+        scaler = TemperatureScaler.load(gat, GAT_TEMP_PATH)
+        scaler.eval()
+        return scaler, True
+    except Exception as e:
+        return None, False
 
 
 @st.cache_resource
@@ -164,24 +245,29 @@ def load_competition(key: str):
     return torch.load(path, weights_only=False)
 
 
+def _build_meta(batch) -> torch.Tensor:
+    """Build 12-dim metadata tensor for a PyG batch."""
+    base = torch.stack([
+        batch.shot_dist.squeeze(),
+        batch.shot_angle.squeeze(),
+        batch.is_header.squeeze().float(),
+        batch.is_open_play.squeeze().float(),
+    ], dim=1)                          # [n, 4]
+    tech = batch.technique.view(-1, 8) # [n, 8]
+    return torch.cat([base, tech], dim=1)  # [n, 12]
+
+
 @st.cache_resource
 def get_predictions(key: str):
     graphs = load_competition(key)
     if not graphs:
         return np.array([])
-    model = load_model()
+    model = load_model()   # TemperatureScaler-wrapped; forward() applies T
     loader = DataLoader(graphs, batch_size=256, shuffle=False)
     probs = []
     with torch.no_grad():
         for batch in loader:
-            base = torch.stack([
-                batch.shot_dist.squeeze(),
-                batch.shot_angle.squeeze(),
-                batch.is_header.squeeze().float(),
-                batch.is_open_play.squeeze().float(),
-            ], dim=1)                          # [n, 4]
-            tech = batch.technique.view(-1, 8) # [n, 8]
-            meta = torch.cat([base, tech], dim=1)  # [n, 12]
+            meta   = _build_meta(batch)
             logits = model(batch.x, batch.edge_index, batch.batch, meta)
             probs.extend(torch.sigmoid(logits.squeeze()).tolist())
     return np.array(probs)
@@ -216,20 +302,13 @@ def build_match_index(key: str) -> dict:
 
 def get_match_predictions(match_graphs: list) -> np.ndarray:
     """Run inference on a match-scoped list of graphs. Returns probs array (N,)."""
-    model = load_model()
+    model  = load_model()   # T-scaled
     loader = DataLoader(match_graphs, batch_size=len(match_graphs), shuffle=False)
     with torch.no_grad():
-        batch = next(iter(loader))
-        base = torch.stack([
-            batch.shot_dist.squeeze(),
-            batch.shot_angle.squeeze(),
-            batch.is_header.squeeze().float(),
-            batch.is_open_play.squeeze().float(),
-        ], dim=1)
-        tech = batch.technique.view(-1, 8)
-        meta = torch.cat([base, tech], dim=1)
+        batch  = next(iter(loader))
+        meta   = _build_meta(batch)
         logits = model(batch.x, batch.edge_index, batch.batch, meta)
-        probs = torch.sigmoid(logits.squeeze()).numpy()
+        probs  = torch.sigmoid(logits.squeeze()).numpy()
     return np.atleast_1d(probs)
 
 
@@ -429,7 +508,8 @@ def shot_map_figure(graphs, hybrid_probs, title=""):
 
 
 def freeze_frame_figure(graph, hybrid_xg, shot_index, total,
-                         node_importance=None, show_saliency=True):
+                         node_importance=None, show_saliency=True,
+                         attn_data=None, show_attention=False):
     """
     Full pitch showing all visible players at the moment of a shot.
     Actor = shooter (gold star), teammates (green), defenders (red), keeper (orange).
@@ -515,15 +595,65 @@ def freeze_frame_figure(graph, hybrid_xg, shot_index, total,
                             ha="left", va="bottom",
                             bbox=dict(boxstyle="round,pad=0.2", fc="#0f0f1a", ec="none", alpha=0.6))
 
+        # ── GAT Attention overlay ─────────────────────────────────────────
+        if show_attention and attn_data is not None:
+            edge_index_np, alpha_E = attn_data
+            # Filter edges that originate from or connect to the shooter
+            src_nodes, dst_nodes = edge_index_np[0], edge_index_np[1]
+            actor_idx = int(np.where(actor)[0][0]) if actor.any() else -1
+
+            # Rank all edges by attention weight; take top-3
+            top_k     = min(3, len(alpha_E))
+            top_edges = np.argsort(alpha_E)[::-1][:top_k]
+
+            attn_cmap = plt.cm.get_cmap("plasma")
+            # Normalise within top-k for colour mapping
+            top_alphas = alpha_E[top_edges]
+            a_max = top_alphas.max() if top_alphas.max() > 1e-8 else 1.0
+
+            for rank, eidx in enumerate(top_edges):
+                src_i, dst_i = int(src_nodes[eidx]), int(dst_nodes[eidx])
+                a_val = float(alpha_E[eidx])
+                a_norm = a_val / a_max
+
+                x0, y0 = xs[src_i], ys[src_i]
+                x1, y1 = xs[dst_i], ys[dst_i]
+                col   = attn_cmap(0.3 + 0.7 * a_norm)
+                lw    = 1.0 + 4.0 * a_norm
+                alpha = 0.45 + 0.45 * a_norm
+
+                ax.annotate(
+                    "", xy=(x1, y1), xytext=(x0, y0),
+                    arrowprops=dict(
+                        arrowstyle="-|>", color=col,
+                        lw=lw, alpha=alpha,
+                        mutation_scale=10 + 8 * a_norm,
+                        connectionstyle="arc3,rad=0.15",
+                    ),
+                    zorder=8,
+                )
+                # Label: rank + alpha value near midpoint
+                mid_x, mid_y = (x0 + x1) / 2, (y0 + y1) / 2
+                ax.text(mid_x + 0.5, mid_y + 0.5,
+                        f"#{rank+1} α={a_val:.3f}",
+                        fontsize=6, color=col, alpha=0.9, zorder=9,
+                        bbox=dict(boxstyle="round,pad=0.15",
+                                  fc="#0f0f1a", ec="none", alpha=0.55))
+
     ax.legend(fontsize=8, loc="upper left", facecolor=PANEL_BG,
               labelcolor=TEXT_COLOR, edgecolor="#444")
 
-    # Saliency legend note
+    # Legend note
     if show_saliency and node_importance is not None:
         ax.text(0.01, 0.01,
                 "── gradient saliency edges: thicker = higher model influence",
                 transform=ax.transAxes, fontsize=6.5, color="#aaa",
                 alpha=0.75, va="bottom")
+    elif show_attention and attn_data is not None:
+        ax.text(0.01, 0.01,
+                "── GAT attention: top-3 player pairs model focused on",
+                transform=ax.transAxes, fontsize=6.5, color="#e040fb",
+                alpha=0.85, va="bottom")
 
     goal = int(graph.y.item())
     outcome_str = "⚽ GOAL" if goal else "✗ No goal"
@@ -790,16 +920,62 @@ elif view == "🔬 Shot Inspector":
         graph        = graphs[selected_idx]
         hybrid_xg    = float(hybrid_probs[selected_idx])
 
-        show_sal = st.sidebar.checkbox("Show gradient saliency", value=True,
-                                       help="Draws edges from shooter to the players "
-                                            "that most influenced the xG prediction "
-                                            "(gradient magnitude w.r.t. node features).")
+        gat_model, gat_available = load_gat_model()
+        overlay_options = ["Gradient Saliency", "GAT Attention (top-3 pairs)", "None"]
+        if not gat_available:
+            overlay_options = ["Gradient Saliency", "None",
+                               "GAT Attention — train HybridGAT first"]
 
-        node_imp = compute_node_saliency(load_model(), graph) if show_sal else None
-        fig = freeze_frame_figure(graph, hybrid_xg, shot_rank - 1, len(filtered_idx),
-                                  node_importance=node_imp, show_saliency=show_sal)
+        overlay = st.sidebar.radio(
+            "Overlay",
+            options=overlay_options[:3] if gat_available else ["Gradient Saliency", "None"],
+            help=(
+                "Gradient Saliency: which players most affect the GCN's xG prediction "
+                "(backprop through node features).\n\n"
+                "GAT Attention: which player pairs the GATv2 model attends to "
+                "during message passing (learned α weights)."
+            ),
+        )
+
+        show_sal  = overlay == "Gradient Saliency"
+        show_attn = overlay == "GAT Attention (top-3 pairs)" and gat_available
+
+        node_imp   = compute_node_saliency(load_model().model, graph) if show_sal else None
+        attn_data  = compute_gat_attention(gat_model, graph) if show_attn else None
+
+        fig = freeze_frame_figure(
+            graph, hybrid_xg, shot_rank - 1, len(filtered_idx),
+            node_importance=node_imp, show_saliency=show_sal,
+            attn_data=attn_data,     show_attention=show_attn,
+        )
         st.pyplot(fig, use_container_width=True)
         plt.close(fig)
+
+        # ── GAT attention table ──────────────────────────────────────────
+        if show_attn and attn_data is not None:
+            edge_index_np, alpha_E = attn_data
+            top_edges = np.argsort(alpha_E)[::-1][:3]
+            st.markdown("**Top-3 attention pairs**")
+            rows = []
+            for rank, eidx in enumerate(top_edges):
+                src_i = int(edge_index_np[0][eidx])
+                dst_i = int(edge_index_np[1][eidx])
+                nodes_np = graph.x.numpy()
+                def _role(ni):
+                    if nodes_np[ni, 3]:  return "🌟 Shooter"
+                    if nodes_np[ni, 4]:  return "🧤 Keeper"
+                    if nodes_np[ni, 2]:  return "🟢 Attacker"
+                    return "🔴 Defender"
+                rows.append({
+                    "Rank":   f"#{rank+1}",
+                    "From":   _role(src_i),
+                    "To":     _role(dst_i),
+                    "α weight": f"{alpha_E[eidx]:.4f}",
+                    "Bar":    "█" * int(alpha_E[eidx] / alpha_E[top_edges[0]] * 12),
+                })
+            import pandas as pd
+            st.dataframe(pd.DataFrame(rows).set_index("Rank"),
+                         use_container_width=True)
 
         # Quick nav
         nc1, nc2 = st.columns(2)
@@ -857,9 +1033,22 @@ elif view == "📊 xG Distributions":
     st.dataframe(pd.DataFrame(rows).set_index("Model"), use_container_width=True)
 
     st.markdown("---")
-    st.markdown(
-        "**Note on calibration:** HybridGCN over-assigns probability to goals (mean xG for goals = "
-        f"{hybrid_probs[labels==1].mean():.2f} vs StatsBomb's {sb_xgs[labels==1].mean():.2f}). "
-        "The model now includes `shot_technique` as an 8-dim one-hot feature. "
-        "Next experiment: temperature scaling to fix residual over-confidence."
-    )
+    # Read the current temperature T from the loaded scaler
+    _scaler = load_model()
+    _T = _scaler.temperature if isinstance(_scaler, TemperatureScaler) else 1.0
+    _calibrated = _T != 1.0
+
+    if _calibrated:
+        st.success(
+            f"✅ **Temperature scaling applied** (T = {_T:.3f}).  "
+            f"Raw logits divided by T before sigmoid — over-confidence above 20% xG is suppressed.  \n"
+            f"Goal mean xG: model={hybrid_probs[labels==1].mean():.3f}  ·  "
+            f"StatsBomb={sb_xgs[labels==1].mean():.3f}"
+        )
+    else:
+        st.info(
+            "**Note on calibration:** No temperature scalar found. Run `train_xg_hybrid.py` "
+            "to generate `pool_7comp_T.pt` and fix over-confidence.  \n"
+            f"Goal mean xG: model={hybrid_probs[labels==1].mean():.3f}  ·  "
+            f"StatsBomb={sb_xgs[labels==1].mean():.3f}"
+        )

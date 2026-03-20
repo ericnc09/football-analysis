@@ -55,6 +55,8 @@ from sklearn.calibration import calibration_curve
 
 from src.models.gcn import FootballGCN
 from src.models.gat import FootballGAT
+from src.models.hybrid_gat import HybridGATModel
+from src.calibration import TemperatureScaler
 
 PROCESSED_DIR = REPO_ROOT / "data" / "processed"
 SEED = 42
@@ -338,6 +340,33 @@ def train_hybrid(train_g, val_g, in_channels, pos_weight):
     return model, val_aucs
 
 
+def train_hybrid_gat(train_g, val_g, in_channels, edge_channels, pos_weight):
+    """Train HybridGATModel — identical loop to train_hybrid but uses GATv2Conv."""
+    model = HybridGATModel(
+        node_in=in_channels, edge_dim=edge_channels,
+        meta_dim=META_DIM, hidden=32, heads=4, n_layers=3, dropout=0.3,
+    ).to(DEVICE)
+    n = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"     HybridGAT: {n:,} params")
+    opt   = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WD)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=12, factor=0.5, min_lr=1e-5)
+    tr_loader = DataLoader(train_g, batch_size=BATCH, shuffle=True)
+    va_loader = DataLoader(val_g,   batch_size=BATCH)
+    best_auc, best_state, val_aucs = 0.0, None, []
+    for ep in range(1, EPOCHS + 1):
+        loss = train_epoch_hybrid(model, tr_loader, opt, pos_weight)
+        auc, _, _ = eval_hybrid(model, va_loader)
+        sched.step(1 - auc)
+        val_aucs.append(auc)
+        if auc > best_auc:
+            best_auc = auc
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+        if ep % 20 == 0:
+            print(f"     ep={ep:3d}  loss={loss:.4f}  val_auc={auc:.3f}")
+    model.load_state_dict(best_state)
+    return model, val_aucs
+
+
 # ---------------------------------------------------------------------------
 # Main experiment
 # ---------------------------------------------------------------------------
@@ -377,16 +406,49 @@ def run_experiment(name, train_g, val_g, test_g):
     )
     _, gat_probs, _ = eval_gnn(gat, DataLoader(test_g, batch_size=BATCH))
 
-    # ── Hybrid model ──────────────────────────────────────────────────────
+    # ── HybridGCN (GCN embedding + shot metadata) ─────────────────────────
     print("\n── HybridGCN (GCN embedding + shot metadata) ────────────────────")
     hybrid, hybrid_aucs = train_hybrid(train_g, val_g, in_ch, pos_weight)
     _, hybrid_probs, _ = eval_hybrid(hybrid, DataLoader(test_g, batch_size=BATCH))
 
-    # Save models
+    # ── Temperature scaling for HybridGCN ─────────────────────────────────
+    print("\n── Temperature Scaling (HybridGCN) ──────────────────────────────")
+    va_loader_for_T = DataLoader(val_g, batch_size=BATCH)
+    scaler = TemperatureScaler(hybrid, init_T=1.5)
+    cal_result = scaler.fit(va_loader_for_T, device=str(DEVICE))
+    # Re-evaluate on test set with calibrated probabilities
+    _, hybrid_probs_raw, _ = eval_hybrid(hybrid, DataLoader(test_g, batch_size=BATCH))
+    T_val = scaler.temperature
+    hybrid_probs_cal = torch.sigmoid(
+        torch.logit(torch.tensor(hybrid_probs_raw).clamp(1e-6, 1 - 1e-6)) / T_val
+    ).numpy()
+
+    # ── HybridGAT (GAT embedding + shot metadata) ─────────────────────────
+    print("\n── HybridGAT (GAT embedding + shot metadata) ────────────────────")
+    hybrid_gat, hybrid_gat_aucs = train_hybrid_gat(
+        train_g, val_g, in_ch, edge_ch, pos_weight
+    )
+    _, hybrid_gat_probs, _ = eval_hybrid(
+        hybrid_gat, DataLoader(test_g, batch_size=BATCH)
+    )
+
+    # Temperature scaling for HybridGAT
+    print("\n── Temperature Scaling (HybridGAT) ──────────────────────────────")
+    scaler_gat = TemperatureScaler(hybrid_gat, init_T=1.5)
+    cal_gat = scaler_gat.fit(va_loader_for_T, device=str(DEVICE))
+    T_gat = scaler_gat.temperature
+    hybrid_gat_probs_cal = torch.sigmoid(
+        torch.logit(torch.tensor(hybrid_gat_probs).clamp(1e-6, 1 - 1e-6)) / T_gat
+    ).numpy()
+
+    # Save models + temperature scalars
     out = PROCESSED_DIR
-    torch.save(gcn.state_dict(),    out / f"{name}_gcn_xg.pt")
-    torch.save(gat.state_dict(),    out / f"{name}_gat_xg.pt")
-    torch.save(hybrid.state_dict(), out / f"pool_7comp_hybrid_xg.pt")  # canonical path used by app.py
+    torch.save(gcn.state_dict(),         out / f"{name}_gcn_xg.pt")
+    torch.save(gat.state_dict(),         out / f"{name}_gat_xg.pt")
+    torch.save(hybrid.state_dict(),      out / "pool_7comp_hybrid_xg.pt")       # canonical GCN path
+    torch.save(hybrid_gat.state_dict(),  out / "pool_7comp_hybrid_gat_xg.pt")   # canonical GAT path
+    scaler.save(    out / "pool_7comp_T.pt")       # GCN temperature
+    scaler_gat.save(out / "pool_7comp_gat_T.pt")   # GAT temperature
 
     # ── Benchmark table ───────────────────────────────────────────────────
     print(f"\n{'='*72}")
@@ -396,72 +458,104 @@ def run_experiment(name, train_g, val_g, test_g):
     print(f"  {'-'*70}")
 
     results = {}
-    results["Majority"]    = print_row("Majority (no goal)", y_test, majority)
-    results["LogReg"]      = print_row("LogReg (dist + angle + header)", y_test, lr_probs)
-    results["StatsBomb xG"]= print_row("StatsBomb xG  [industry reference]", y_test, sb_xg)
-    results["GCN"]         = print_row("GCN  [graph spatial only]", y_test, gcn_probs)
-    results["GAT"]         = print_row("GAT  [graph + edge attention]", y_test, gat_probs)
-    results["HybridGCN"]   = print_row("HybridGCN  [GCN + dist/angle/header/technique]", y_test, hybrid_probs)
+    results["Majority"]        = print_row("Majority (no goal)", y_test, majority)
+    results["LogReg"]          = print_row("LogReg (dist + angle + header)", y_test, lr_probs)
+    results["StatsBomb xG"]    = print_row("StatsBomb xG  [industry reference]", y_test, sb_xg)
+    results["GCN"]             = print_row("GCN  [graph spatial only]", y_test, gcn_probs)
+    results["GAT"]             = print_row("GAT  [graph + edge attention]", y_test, gat_probs)
+    results["HybridGCN"]       = print_row("HybridGCN  [GCN + metadata]", y_test, hybrid_probs)
+    results["HybridGCN+T"]     = print_row(f"HybridGCN+T  [T={T_val:.3f}]", y_test, hybrid_probs_cal)
+    results["HybridGAT"]       = print_row("HybridGAT  [GAT + metadata]", y_test, hybrid_gat_probs)
+    results["HybridGAT+T"]     = print_row(f"HybridGAT+T  [T={T_gat:.3f}]", y_test, hybrid_gat_probs_cal)
     print(f"  {'-'*70}")
 
     sb_auc     = results["StatsBomb xG"]["auc"]
     hyb_auc    = results["HybridGCN"]["auc"]
+    hyb_t_auc  = results["HybridGCN+T"]["auc"]
+    gat_t_auc  = results["HybridGAT+T"]["auc"]
     gcn_auc    = results["GCN"]["auc"]
     lr_auc     = results["LogReg"]["auc"]
-    print(f"\n  StatsBomb xG  : {sb_auc:.3f}")
-    print(f"  HybridGCN     : {hyb_auc:.3f}  (gap to SB: {sb_auc - hyb_auc:+.3f})")
-    print(f"  GCN           : {gcn_auc:.3f}  (hybrid gain: {hyb_auc - gcn_auc:+.3f})")
-    print(f"  LogReg        : {lr_auc:.3f}  (hybrid gain: {hyb_auc - lr_auc:+.3f})")
+    print(f"\n  StatsBomb xG    : {sb_auc:.3f}")
+    print(f"  HybridGCN       : {hyb_auc:.3f}  (gap to SB: {sb_auc - hyb_auc:+.3f})")
+    print(f"  HybridGCN+T     : {hyb_t_auc:.3f}  Brier {cal_result['brier_before']:.3f} → {cal_result['brier_after']:.3f}")
+    print(f"  HybridGAT+T     : {gat_t_auc:.3f}  Brier {cal_gat['brier_before']:.3f} → {cal_gat['brier_after']:.3f}")
+    print(f"  GCN             : {gcn_auc:.3f}  (hybrid gain: {hyb_auc - gcn_auc:+.3f})")
+    print(f"  LogReg          : {lr_auc:.3f}  (hybrid gain: {hyb_auc - lr_auc:+.3f})")
 
     # ── Plots ─────────────────────────────────────────────────────────────
     fig, axes = plt.subplots(1, 3, figsize=(17, 5))
 
     # ROC curves
     ax = axes[0]
-    colors = {"StatsBomb xG": "gold", "LogReg": "steelblue",
-              "GCN": "mediumpurple", "GAT": "coral", "HybridGCN": "limegreen"}
+    colors = {
+        "StatsBomb xG": "gold",    "LogReg":       "steelblue",
+        "GCN":          "mediumpurple", "GAT":      "coral",
+        "HybridGCN":    "limegreen",   "HybridGCN+T": "#00e5ff",
+        "HybridGAT":    "#ff9800",     "HybridGAT+T": "#e040fb",
+    }
     for label, probs in [
-        ("StatsBomb xG", sb_xg),
-        ("LogReg",       lr_probs),
-        ("GCN",          gcn_probs),
-        ("GAT",          gat_probs),
-        ("HybridGCN",    hybrid_probs),
+        ("StatsBomb xG",  sb_xg),
+        ("LogReg",        lr_probs),
+        ("GCN",           gcn_probs),
+        ("GAT",           gat_probs),
+        ("HybridGCN",     hybrid_probs),
+        ("HybridGCN+T",   hybrid_probs_cal),
+        ("HybridGAT+T",   hybrid_gat_probs_cal),
     ]:
         fpr, tpr, _ = roc_curve(y_test, probs)
         auc = roc_auc_score(y_test, probs)
-        lw  = 2.5 if label in ("StatsBomb xG", "HybridGCN") else 1.5
+        lw  = 2.5 if label in ("StatsBomb xG", "HybridGCN+T", "HybridGAT+T") else 1.5
         ls  = "--" if label == "StatsBomb xG" else "-"
         ax.plot(fpr, tpr, lw=lw, ls=ls, color=colors.get(label),
                 label=f"{label} ({auc:.3f})")
     ax.plot([0, 1], [0, 1], "k--", alpha=0.3)
     ax.set(title="ROC Curve", xlabel="FPR", ylabel="TPR")
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=7.5)
     ax.grid(alpha=0.3)
 
     # Val AUC curves
     ax = axes[1]
-    for label, aucs in [("GCN", gcn_aucs), ("GAT", gat_aucs), ("HybridGCN", hybrid_aucs)]:
-        lw = 2.0 if label == "HybridGCN" else 1.2
+    for label, aucs in [
+        ("GCN",       gcn_aucs),
+        ("GAT",       gat_aucs),
+        ("HybridGCN", hybrid_aucs),
+        ("HybridGAT", hybrid_gat_aucs),
+    ]:
+        lw = 2.0 if "Hybrid" in label else 1.2
         ax.plot(aucs, lw=lw, label=label, color=colors.get(label))
     ax.axhline(sb_auc, color="gold", ls="--", lw=1.5,
                label=f"StatsBomb xG ({sb_auc:.3f})")
     ax.axhline(lr_auc, color="steelblue", ls=":", lw=1.2,
                label=f"LogReg ({lr_auc:.3f})")
     ax.set(title="Val AUC vs Epochs", xlabel="Epoch", ylabel="AUC")
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=7.5)
     ax.grid(alpha=0.3)
 
-    # AUC bar chart comparison
+    # Brier score comparison (calibration impact)
     ax = axes[2]
-    model_names = ["Majority", "LogReg", "GCN", "GAT", "HybridGCN", "StatsBomb xG"]
-    aucs_bar = [results[m]["auc"] for m in model_names]
-    bar_colors = ["#555", "steelblue", "mediumpurple", "coral", "limegreen", "gold"]
-    bars = ax.barh(model_names, aucs_bar, color=bar_colors, alpha=0.85, edgecolor="white")
-    for bar, val in zip(bars, aucs_bar):
-        ax.text(val + 0.003, bar.get_y() + bar.get_height() / 2,
+    brier_names = [
+        "HybridGCN (raw)",
+        f"HybridGCN+T (T={T_val:.2f})",
+        "HybridGAT (raw)",
+        f"HybridGAT+T (T={T_gat:.2f})",
+        "StatsBomb xG",
+    ]
+    from sklearn.metrics import brier_score_loss
+    brier_vals = [
+        brier_score_loss(y_test, hybrid_probs),
+        brier_score_loss(y_test, hybrid_probs_cal),
+        brier_score_loss(y_test, hybrid_gat_probs),
+        brier_score_loss(y_test, hybrid_gat_probs_cal),
+        brier_score_loss(y_test, sb_xg),
+    ]
+    b_colors = ["limegreen", "#00e5ff", "#ff9800", "#e040fb", "gold"]
+    bars = ax.barh(brier_names, brier_vals, color=b_colors, alpha=0.85, edgecolor="white")
+    for bar, val in zip(bars, brier_vals):
+        ax.text(val + 0.001, bar.get_y() + bar.get_height() / 2,
                 f"{val:.3f}", va="center", fontsize=9)
-    ax.set(title="AUC Comparison", xlabel="ROC AUC", xlim=(0.45, 0.90))
-    ax.axvline(0.5, color="gray", ls="--", alpha=0.5)
+    ax.set(title="Brier Score (lower = better calibration)",
+           xlabel="Brier Score", xlim=(0.0, 0.25))
+    ax.axvline(brier_score_loss(y_test, sb_xg), color="gold", ls="--", alpha=0.6)
     ax.grid(alpha=0.3, axis="x")
 
     plt.suptitle(f"xG Benchmark — {name}", fontsize=13, fontweight="bold")

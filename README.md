@@ -2,6 +2,10 @@
 
 Graph Neural Network (GNN) research applied to football (soccer). Players are modeled as nodes, their spatial interactions and passes as edges — enabling models to reason about team shape, pressing traps, and off-ball movement as relational structures.
 
+![Football GNN Dashboard — Shot Map · Freeze Frame · Gradient Saliency · xG Comparison](assets/dashboard_hero.png)
+
+> **HybridGCN achieves 0.752 AUC** on 8,013 shots across 7 StatsBomb 360 competitions — reaching 95% of StatsBomb's proprietary xG (0.794 AUC) using only free, open data. Gradient-saliency edges show *which players most influenced each xG prediction*.
+
 ## Goal
 
 Build a pipeline from raw football data → spatial graphs → GNN models that can:

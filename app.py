@@ -102,6 +102,43 @@ class HybridXGModel(nn.Module):
         return self.head(torch.cat([self.encode(x, edge_index, batch), metadata], dim=1))
 
 
+# ── Gradient saliency ─────────────────────────────────────────────────────────
+def compute_node_saliency(model, graph):
+    """
+    Gradient-based node importance for a single shot graph.
+
+    Runs a forward pass with gradients enabled on node features, backprops
+    the predicted xG, and returns per-node importance as the sum of absolute
+    input gradients across all node features.
+
+    Returns
+    -------
+    importance : np.ndarray, shape [n_nodes]
+        Importance score per player; higher = more influential.
+    """
+    model.eval()
+    x = graph.x.clone().detach().float().requires_grad_(True)
+    ei = graph.edge_index
+    batch = torch.zeros(graph.x.shape[0], dtype=torch.long)
+    meta = torch.tensor([[
+        float(graph.shot_dist.item()),
+        float(graph.shot_angle.item()),
+        float(graph.is_header.item()),
+        float(graph.is_open_play.item()),
+    ]])
+
+    logit = model(x, ei, batch, meta)
+    pred  = torch.sigmoid(logit).squeeze()
+    pred.backward()
+
+    importance = x.grad.abs().sum(dim=1).detach().numpy()
+    # Normalise 0→1 for display
+    rng = importance.max() - importance.min()
+    if rng > 1e-8:
+        importance = (importance - importance.min()) / rng
+    return importance
+
+
 # ── Cached loaders ────────────────────────────────────────────────────────────
 @st.cache_resource
 def load_model():
@@ -203,10 +240,14 @@ def shot_map_figure(graphs, hybrid_probs, title=""):
     return fig
 
 
-def freeze_frame_figure(graph, hybrid_xg, shot_index, total):
+def freeze_frame_figure(graph, hybrid_xg, shot_index, total,
+                         node_importance=None, show_saliency=True):
     """
     Full pitch showing all visible players at the moment of a shot.
     Actor = shooter (gold star), teammates (green), defenders (red), keeper (orange).
+
+    If node_importance is provided and show_saliency is True, draws gradient-saliency
+    edges from the shooter to the top-5 most influential players.
     """
     fig, axes = plt.subplots(1, 2, figsize=(14, 6), facecolor=DARK_BG,
                              gridspec_kw={"width_ratios": [2.2, 1]})
@@ -255,8 +296,46 @@ def freeze_frame_figure(graph, hybrid_xg, shot_index, total):
                      color="#FFD54F", width=1.2, headwidth=4, headlength=4,
                      alpha=0.7, zorder=4)
 
+        # ── Gradient-saliency overlay ─────────────────────────────────────
+        if show_saliency and node_importance is not None and len(node_importance) > 0:
+            # Zero out the shooter's own importance so we rank other players
+            imp = node_importance.copy()
+            actor_idx = np.where(actor)[0]
+            if len(actor_idx):
+                imp[actor_idx[0]] = 0.0
+
+            # Top-5 most influential other players
+            top_k = min(5, (imp > 0).sum())
+            if top_k > 0:
+                top_nodes = np.argsort(imp)[::-1][:top_k]
+                imp_vals  = imp[top_nodes]
+
+                saliency_cmap = plt.cm.get_cmap("cool")
+                for rank, (ni, iv) in enumerate(zip(top_nodes, imp_vals)):
+                    if iv < 0.05:
+                        continue
+                    tx, ty = xs[ni], ys[ni]
+                    col   = saliency_cmap(0.4 + 0.6 * iv)
+                    lw    = 0.8 + 3.5 * iv
+                    alpha = 0.35 + 0.55 * iv
+                    ax.plot([sx, tx], [sy, ty], color=col, lw=lw, alpha=alpha,
+                            zorder=3, solid_capstyle="round",
+                            linestyle=(0, (3, 2)) if rank > 1 else "-")
+                    # Importance score label near the player
+                    ax.text(tx + 0.8, ty + 0.5, f"{iv:.2f}",
+                            fontsize=6.5, color=col, alpha=0.85, zorder=8,
+                            ha="left", va="bottom",
+                            bbox=dict(boxstyle="round,pad=0.2", fc="#0f0f1a", ec="none", alpha=0.6))
+
     ax.legend(fontsize=8, loc="upper left", facecolor=PANEL_BG,
               labelcolor=TEXT_COLOR, edgecolor="#444")
+
+    # Saliency legend note
+    if show_saliency and node_importance is not None:
+        ax.text(0.01, 0.01,
+                "── gradient saliency edges: thicker = higher model influence",
+                transform=ax.transAxes, fontsize=6.5, color="#aaa",
+                alpha=0.75, va="bottom")
 
     goal = int(graph.y.item())
     outcome_str = "⚽ GOAL" if goal else "✗ No goal"
@@ -513,7 +592,14 @@ elif view == "🔬 Shot Inspector":
         graph        = graphs[selected_idx]
         hybrid_xg    = float(hybrid_probs[selected_idx])
 
-        fig = freeze_frame_figure(graph, hybrid_xg, shot_rank - 1, len(filtered_idx))
+        show_sal = st.sidebar.checkbox("Show gradient saliency", value=True,
+                                       help="Draws edges from shooter to the players "
+                                            "that most influenced the xG prediction "
+                                            "(gradient magnitude w.r.t. node features).")
+
+        node_imp = compute_node_saliency(load_model(), graph) if show_sal else None
+        fig = freeze_frame_figure(graph, hybrid_xg, shot_rank - 1, len(filtered_idx),
+                                  node_importance=node_imp, show_saliency=show_sal)
         st.pyplot(fig, use_container_width=True)
         plt.close(fig)
 

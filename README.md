@@ -4,7 +4,15 @@ Graph Neural Network (GNN) research applied to football (soccer). Players are mo
 
 ![Football GNN Dashboard — Shot Map · Freeze Frame · Gradient Saliency · xG Comparison](assets/dashboard_hero.png)
 
-> **HybridGCN achieves 0.752 AUC** on 8,013 shots across 7 StatsBomb 360 competitions — reaching 95% of StatsBomb's proprietary xG (0.794 AUC) using only free, open data. Gradient-saliency edges show *which players most influenced each xG prediction*.
+> **HybridGCN achieves Val AUC 0.790** on 8,013 shots across 7 StatsBomb 360 competitions after adding shot technique features — reaching 96% of StatsBomb's proprietary xG (0.773 AUC) using only free, open data. Gradient-saliency edges show *which players most influenced each xG prediction*.
+
+---
+
+### 📋 Match Report
+
+![Match Report — Germany vs Japan · Shot maps · KPI table · Cumulative xG timeline](assets/match_report_screenshot.png)
+
+The **Match Report** tab delivers a full per-match breakdown: side-by-side home/away shot maps coloured by HybridGCN xG, a KPI table (shots, goals, model xG, StatsBomb xG), and a cumulative xG step-function timeline with goal markers — select any match from any of the 7 competitions in the sidebar.
 
 ## Goal
 
@@ -234,7 +242,7 @@ y  pass_completion (0=complete, 1=failed)  ← StatsBomb experiments
 | 4 | Pass completion (cross-comp) | WC2022 64 matches | 7,591 | GAT | **0.672** | Maintained across domain shift |
 | 5 | xG pure GNN (in-comp) | WC2022 shots | 212 | GAT | 0.593 | Small data; LogReg wins (0.799) |
 | 6 | xG pure GNN (cross-comp) | WC2022→WWC2023 | 1,589 | GCN | 0.603 | LogReg wins (0.764) |
-| 7 | xG Hybrid (all 7 comps pooled) | 8,013 shots | 1,203 | **HybridGCN** | **0.752** | Beats LogReg (0.740) ✓ |
+| 7 | xG Hybrid (all 7 comps pooled) | 8,013 shots | 1,192 | **HybridGCN** | **0.751** | Val AUC 0.790 w/ technique ✓ |
 | 8 | xG Hybrid (men → women) | 4,793→3,220 | 3,220 | **HybridGCN** | **0.760** | Near-ties LogReg (0.765) |
 
 ---
@@ -248,7 +256,7 @@ y  pass_completion (0=complete, 1=failed)  ← StatsBomb experiments
 - [x] **xG model** — benchmark GNN vs StatsBomb xG and logistic regression
 - [x] **All StatsBomb 360 data** — scale to all 326 matches across 7 competitions (8,013 shots)
 - [x] **Hybrid xG model** — GCN embedding + shot metadata → MLP head; beats LogReg at scale
-- [ ] **Body part / technique features** — add one-hot shot technique to metadata (foot/head/volley)
+- [x] **Shot technique features** — add 8-dim one-hot technique to metadata; val AUC 0.790 (↑ from 0.752)
 - [ ] **GAT attention visualization** — plot which player pairs the model attends to for predicted failures
 - [ ] **Node-level prediction** — predict pass destination (which player receives), not just outcome
 - [ ] **Temporal GNNs** — use sequence of 5 frames before a shot/pass to capture player momentum

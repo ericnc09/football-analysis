@@ -51,7 +51,7 @@ from src.graph_builder import (
     _compute_edge_features,
     PITCH_LENGTH, PITCH_WIDTH,
 )
-from src.features import enrich_graph
+from src.features import enrich_graph, encode_technique
 
 PROCESSED_DIR = REPO_ROOT / "data" / "processed"
 
@@ -93,7 +93,13 @@ def _shot_distance_angle(shot_loc: list) -> tuple[float, float]:
 
 def build_shot_graph(freeze_frame: list, label: float,
                      sb_xg: float, shot_loc: list,
-                     is_header: bool, is_open_play: bool) -> Data:
+                     is_header: bool, is_open_play: bool,
+                     technique: str = "",
+                     match_id: int = 0,
+                     minute: int = 0,
+                     player_name: str = "",
+                     team_name: str = "",
+                     home_team: str = "") -> Data:
     """Convert a StatsBomb 360 shot freeze frame into a PyG Data object."""
     positions, teams = [], []
     for p in freeze_frame:
@@ -122,12 +128,20 @@ def build_shot_graph(freeze_frame: list, label: float,
         edge_index = torch.tensor(edge_index_np, dtype=torch.long),
         edge_attr  = torch.tensor(edge_attr_np,  dtype=torch.float),
         y          = torch.tensor([label],        dtype=torch.float),
-        # metadata for benchmarking
-        sb_xg       = torch.tensor([sb_xg],            dtype=torch.float),
-        shot_dist   = torch.tensor([dist_m],           dtype=torch.float),
-        shot_angle  = torch.tensor([angle_rad],        dtype=torch.float),
-        is_header   = torch.tensor([float(is_header)], dtype=torch.float),
-        is_open_play= torch.tensor([float(is_open_play)], dtype=torch.float),
+        # metadata for benchmarking / model input
+        sb_xg        = torch.tensor([sb_xg],                dtype=torch.float),
+        shot_dist    = torch.tensor([dist_m],               dtype=torch.float),
+        shot_angle   = torch.tensor([angle_rad],            dtype=torch.float),
+        is_header    = torch.tensor([float(is_header)],     dtype=torch.float),
+        is_open_play = torch.tensor([float(is_open_play)],  dtype=torch.float),
+        # shot technique (8-dim one-hot: 0=unknown, 1-7=named techniques)
+        technique    = torch.tensor(encode_technique(technique), dtype=torch.float),
+        # match-level context (for per-match report)
+        match_id     = torch.tensor([match_id],  dtype=torch.long),
+        minute       = torch.tensor([minute],    dtype=torch.long),
+        player_name  = player_name,
+        team_name    = team_name,
+        home_team    = home_team,
     )
     return data
 
@@ -136,7 +150,7 @@ def build_shot_graph(freeze_frame: list, label: float,
 # Per-match processing
 # ---------------------------------------------------------------------------
 
-def process_match(match_id: int) -> tuple[list, dict]:
+def process_match(match_id: int, home_team: str = "") -> tuple[list, dict]:
     stats = {"total_shots": 0, "with_frame": 0, "goals": 0, "no_goals": 0,
              "skipped_small": 0, "graphs": 0}
 
@@ -168,20 +182,27 @@ def process_match(match_id: int) -> tuple[list, dict]:
         else:
             stats["no_goals"] += 1
 
-        sb_xg       = float(row.get("shot_statsbomb_xg", 0.0) or 0.0)
-        shot_loc    = row.get("location", [60.0, 40.0])
-        body_part   = str(row.get("shot_body_part", "") or "")
-        shot_type   = str(row.get("shot_type", "") or "")
-        is_header   = "Head" in body_part
+        sb_xg        = float(row.get("shot_statsbomb_xg", 0.0) or 0.0)
+        shot_loc     = row.get("location", [60.0, 40.0])
+        body_part    = str(row.get("shot_body_part", "") or "")
+        shot_type    = str(row.get("shot_type", "") or "")
+        is_header    = "Head" in body_part
         is_open_play = shot_type == "Open Play"
+        technique    = str(row.get("shot_technique", "") or "")
+        minute       = int(row.get("minute", 0) or 0)
+        player_name  = str(row.get("player", "") or "")
+        team_name    = str(row.get("team", "") or "")
 
         if len(ff) < 3:
             stats["skipped_small"] += 1
             continue
 
         try:
-            graph = build_shot_graph(ff, label, sb_xg, shot_loc,
-                                     is_header, is_open_play)
+            graph = build_shot_graph(
+                ff, label, sb_xg, shot_loc, is_header, is_open_play,
+                technique=technique, match_id=match_id, minute=minute,
+                player_name=player_name, team_name=team_name, home_team=home_team,
+            )
             graph = enrich_graph(graph, attacking_right=True, pressure_radius=5.0)
             dataset.append(graph)
             stats["graphs"] += 1
@@ -214,11 +235,11 @@ def build_competition_shots(competition_ids: list[int], season_ids: list[int],
 
         for i, mid in enumerate(match_ids, 1):
             row  = matches[matches["match_id"] == mid].iloc[0]
-            home = row.get("home_team", "?")
-            away = row.get("away_team", "?")
+            home = str(row.get("home_team", "") or "")
+            away = str(row.get("away_team", "") or "")
             print(f"  [{i:2d}/{len(match_ids)}] {home} vs {away} ... ", end="", flush=True)
 
-            graphs, stats = process_match(mid)
+            graphs, stats = process_match(mid, home_team=home)
             all_graphs.extend(graphs)
             for k in total:
                 total[k] += stats.get(k, 0)

@@ -48,6 +48,26 @@ ROLE_INDEX: dict[str, int] = {
 }
 NUM_ROLES = len(ROLE_INDEX) + 1  # +1 for unknown
 
+# StatsBomb shot_technique strings → integer index (0 = unknown)
+TECHNIQUE_INDEX: dict[str, int] = {
+    "normal":         1,
+    "volley":         2,
+    "half volley":    3,
+    "lob":            4,
+    "backheel":       5,
+    "overhead kick":  6,
+    "diving header":  7,
+}
+NUM_TECHNIQUES = len(TECHNIQUE_INDEX) + 1  # 8 (0 = unknown)
+
+
+def encode_technique(technique: str) -> np.ndarray:
+    """One-hot encode a shot_technique string → (NUM_TECHNIQUES,) float32 array."""
+    enc = np.zeros(NUM_TECHNIQUES, dtype=np.float32)
+    idx = TECHNIQUE_INDEX.get((technique or "").lower().strip(), 0)
+    enc[idx] = 1.0
+    return enc
+
 
 # ---------------------------------------------------------------------------
 # Individual feature computations

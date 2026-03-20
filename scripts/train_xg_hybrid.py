@@ -67,7 +67,7 @@ EPOCHS = 120
 BATCH  = 64
 LR     = 1e-3
 WD     = 1e-4
-META_DIM = 4   # shot_dist, shot_angle, is_header, is_open_play
+META_DIM = 12  # shot_dist, shot_angle, is_header, is_open_play + technique (8-dim one-hot)
 
 
 # ---------------------------------------------------------------------------
@@ -77,10 +77,10 @@ META_DIM = 4   # shot_dist, shot_angle, is_header, is_open_play
 class HybridXGModel(nn.Module):
     """
     GCN that produces a graph-level embedding, then concatenates it with
-    4 hand-crafted shot features before a small MLP head.
+    12 hand-crafted shot features before a small MLP head.
 
     GCN path : node features → 3× GCNConv → global_mean_pool → hidden_dim
-    Meta path : [dist, angle, header, open_play]
+    Meta path : [dist, angle, header, open_play, technique×8]
     Head      : Linear(hidden + meta, hidden) → ReLU → Dropout → Linear(→ 1)
     """
 
@@ -156,12 +156,17 @@ def label_dist(graphs, name=""):
 
 
 def get_metadata(graphs) -> np.ndarray:
-    return np.array([[
-        g.shot_dist.item(),
-        g.shot_angle.item(),
-        g.is_header.item(),
-        g.is_open_play.item(),
-    ] for g in graphs], dtype=np.float32)
+    rows = []
+    for g in graphs:
+        base = [
+            g.shot_dist.item(),
+            g.shot_angle.item(),
+            g.is_header.item(),
+            g.is_open_play.item(),
+        ]
+        tech = g.technique.tolist()  # 8-dim one-hot
+        rows.append(base + tech)
+    return np.array(rows, dtype=np.float32)
 
 
 def get_sb_xg(graphs) -> np.ndarray:
@@ -265,13 +270,15 @@ def train_standard_gnn(ModelClass, kwargs, train_g, val_g, pos_weight, label):
 # ---------------------------------------------------------------------------
 
 def _metadata_tensor(batch) -> torch.Tensor:
-    """Stack per-graph metadata features into [n_graphs, META_DIM]."""
-    return torch.stack([
+    """Stack per-graph metadata features into [n_graphs, META_DIM=12]."""
+    base = torch.stack([
         batch.shot_dist.squeeze(),
         batch.shot_angle.squeeze(),
         batch.is_header.squeeze().float(),
         batch.is_open_play.squeeze().float(),
-    ], dim=1).to(DEVICE)
+    ], dim=1)                          # [n, 4]
+    tech = batch.technique.view(-1, 8) # [n, 8]
+    return torch.cat([base, tech], dim=1).to(DEVICE)  # [n, 12]
 
 
 def train_epoch_hybrid(model, loader, optimizer, pos_weight):
@@ -379,7 +386,7 @@ def run_experiment(name, train_g, val_g, test_g):
     out = PROCESSED_DIR
     torch.save(gcn.state_dict(),    out / f"{name}_gcn_xg.pt")
     torch.save(gat.state_dict(),    out / f"{name}_gat_xg.pt")
-    torch.save(hybrid.state_dict(), out / f"{name}_hybrid_xg.pt")
+    torch.save(hybrid.state_dict(), out / f"pool_7comp_hybrid_xg.pt")  # canonical path used by app.py
 
     # ── Benchmark table ───────────────────────────────────────────────────
     print(f"\n{'='*72}")
@@ -394,7 +401,7 @@ def run_experiment(name, train_g, val_g, test_g):
     results["StatsBomb xG"]= print_row("StatsBomb xG  [industry reference]", y_test, sb_xg)
     results["GCN"]         = print_row("GCN  [graph spatial only]", y_test, gcn_probs)
     results["GAT"]         = print_row("GAT  [graph + edge attention]", y_test, gat_probs)
-    results["HybridGCN"]   = print_row("HybridGCN  [GCN embedding + dist/angle/header]", y_test, hybrid_probs)
+    results["HybridGCN"]   = print_row("HybridGCN  [GCN + dist/angle/header/technique]", y_test, hybrid_probs)
     print(f"  {'-'*70}")
 
     sb_auc     = results["StatsBomb xG"]["auc"]

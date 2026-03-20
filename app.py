@@ -31,6 +31,8 @@ import streamlit as st
 REPO_ROOT = Path(__file__).parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from src.features import TECHNIQUE_INDEX, NUM_TECHNIQUES
+
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Football GNN · xG Dashboard",
@@ -61,7 +63,11 @@ st.markdown("""
 # ── Constants ─────────────────────────────────────────────────────────────────
 PROCESSED  = REPO_ROOT / "data" / "processed"
 MODEL_PATH = PROCESSED / "pool_7comp_hybrid_xg.pt"
-META_DIM   = 4
+META_DIM   = 12  # shot_dist, shot_angle, is_header, is_open_play + technique (8-dim one-hot)
+
+# Technique index → display name
+TECHNIQUE_NAMES: dict[int, str] = {v: k.title() for k, v in TECHNIQUE_INDEX.items()}
+TECHNIQUE_NAMES[0] = "Normal"  # unknown bucket shown as Normal
 
 COMPETITIONS = {
     "wc2022":         "🏆 FIFA World Cup 2022",
@@ -120,12 +126,14 @@ def compute_node_saliency(model, graph):
     x = graph.x.clone().detach().float().requires_grad_(True)
     ei = graph.edge_index
     batch = torch.zeros(graph.x.shape[0], dtype=torch.long)
-    meta = torch.tensor([[
+    base = torch.tensor([[
         float(graph.shot_dist.item()),
         float(graph.shot_angle.item()),
         float(graph.is_header.item()),
         float(graph.is_open_play.item()),
-    ]])
+    ]])                                        # [1, 4]
+    tech = graph.technique.unsqueeze(0)        # [1, 8]
+    meta = torch.cat([base, tech], dim=1)      # [1, 12]
 
     logit = model(x, ei, batch, meta)
     pred  = torch.sigmoid(logit).squeeze()
@@ -166,15 +174,195 @@ def get_predictions(key: str):
     probs = []
     with torch.no_grad():
         for batch in loader:
-            meta = torch.stack([
+            base = torch.stack([
                 batch.shot_dist.squeeze(),
                 batch.shot_angle.squeeze(),
                 batch.is_header.squeeze().float(),
                 batch.is_open_play.squeeze().float(),
-            ], dim=1)
+            ], dim=1)                          # [n, 4]
+            tech = batch.technique.view(-1, 8) # [n, 8]
+            meta = torch.cat([base, tech], dim=1)  # [n, 12]
             logits = model(batch.x, batch.edge_index, batch.batch, meta)
             probs.extend(torch.sigmoid(logits.squeeze()).tolist())
     return np.array(probs)
+
+
+@st.cache_resource
+def build_match_index(key: str) -> dict:
+    """
+    Group graphs by match_id.
+    Returns {match_id: {graphs, home_team, away_team, label}}, sorted by match_id.
+    """
+    graphs = load_competition(key)
+    index: dict[int, dict] = {}
+    for g in graphs:
+        mid = int(g.match_id.item())
+        if mid not in index:
+            index[mid] = {"graphs": [], "home_team": g.home_team, "away_team": ""}
+        index[mid]["graphs"].append(g)
+        # Determine away team: first team_name that differs from home_team
+        if not index[mid]["away_team"] and g.team_name != g.home_team:
+            index[mid]["away_team"] = g.team_name
+
+    # Build display labels
+    for mid, entry in index.items():
+        n = len(entry["graphs"])
+        home = entry["home_team"] or "Home"
+        away = entry["away_team"] or "Away"
+        entry["label"] = f"{home} vs {away}  ({n} shots)"
+
+    return dict(sorted(index.items()))
+
+
+def get_match_predictions(match_graphs: list) -> np.ndarray:
+    """Run inference on a match-scoped list of graphs. Returns probs array (N,)."""
+    model = load_model()
+    loader = DataLoader(match_graphs, batch_size=len(match_graphs), shuffle=False)
+    with torch.no_grad():
+        batch = next(iter(loader))
+        base = torch.stack([
+            batch.shot_dist.squeeze(),
+            batch.shot_angle.squeeze(),
+            batch.is_header.squeeze().float(),
+            batch.is_open_play.squeeze().float(),
+        ], dim=1)
+        tech = batch.technique.view(-1, 8)
+        meta = torch.cat([base, tech], dim=1)
+        logits = model(batch.x, batch.edge_index, batch.batch, meta)
+        probs = torch.sigmoid(logits.squeeze()).numpy()
+    return np.atleast_1d(probs)
+
+
+def _match_kpis(graphs: list, probs: np.ndarray) -> dict:
+    """Compute {shots, goals, xG_hybrid, xG_sb} for a list of graphs."""
+    return {
+        "shots":     len(graphs),
+        "goals":     int(sum(int(g.y.item()) for g in graphs)),
+        "xG_hybrid": float(probs.sum()) if len(probs) else 0.0,
+        "xG_sb":     float(sum(g.sb_xg.item() for g in graphs)),
+    }
+
+
+def _draw_shot_map_on_ax(ax, graphs: list, probs: np.ndarray, title: str) -> None:
+    """Draw a half-pitch shot map on an existing Axes."""
+    pitch = VerticalPitch(
+        pitch_type="custom", pitch_length=PL, pitch_width=PW,
+        pitch_color=PANEL_BG, line_color="#555", half=True,
+        goal_type="box", pad_top=2, pad_bottom=2,
+    )
+    pitch.draw(ax=ax)
+
+    goals_mask = np.array([int(g.y.item()) for g in graphs]) == 1
+    shooter_x  = np.array([g.x[g.x[:, 3] == 1][0, 0].item() for g in graphs])
+    shooter_y  = np.array([g.x[g.x[:, 3] == 1][0, 1].item() for g in graphs])
+
+    if (~goals_mask).any():
+        pitch.scatter(shooter_x[~goals_mask], shooter_y[~goals_mask], ax=ax,
+                      c=probs[~goals_mask], cmap="RdYlGn", vmin=0, vmax=1,
+                      s=55, alpha=0.65, zorder=3, marker="o")
+    if goals_mask.any():
+        pitch.scatter(shooter_x[goals_mask], shooter_y[goals_mask], ax=ax,
+                      c=probs[goals_mask], cmap="RdYlGn", vmin=0, vmax=1,
+                      s=180, alpha=0.95, zorder=5, marker="*",
+                      edgecolors="white", linewidths=0.8)
+
+    ax.set_title(title, color=TEXT_COLOR, fontsize=10, fontweight="bold")
+
+
+def _draw_cumulative_xg(ax, match_graphs: list, match_probs: np.ndarray,
+                         home_team: str, away_team: str) -> None:
+    """Draw step-function cumulative xG timeline, one line per team."""
+    home_mask = np.array([g.team_name == home_team for g in match_graphs])
+    away_mask = ~home_mask
+
+    def _cum_series(mask):
+        subset = [(int(match_graphs[i].minute.item()), float(match_probs[i]))
+                  for i in range(len(match_graphs)) if mask[i]]
+        subset.sort(key=lambda t: t[0])
+        if not subset:
+            return [0], [0.0]
+        mins, xgs = zip(*subset)
+        cumxg = np.cumsum(xgs).tolist()
+        # Prepend 0 at minute 0 for clean step start
+        return [0] + list(mins), [0.0] + cumxg
+
+    home_mins, home_cum = _cum_series(home_mask)
+    away_mins, away_cum = _cum_series(away_mask)
+
+    ax.step(home_mins, home_cum, where="post", color="#4FC3F7", lw=2.2,
+            label=f"{home_team or 'Home'}  ({home_cum[-1]:.2f} xG)")
+    ax.step(away_mins, away_cum, where="post", color="#EF5350", lw=2.2,
+            label=f"{away_team or 'Away'}  ({away_cum[-1]:.2f} xG)")
+
+    # Mark goals with vertical dashed lines
+    for i, g in enumerate(match_graphs):
+        if int(g.y.item()) == 1:
+            min_ = int(g.minute.item())
+            col  = "#4FC3F7" if home_mask[i] else "#EF5350"
+            ax.axvline(min_, color=col, ls="--", lw=0.8, alpha=0.55)
+            ax.text(min_ + 0.4, ax.get_ylim()[1] * 0.92, "⚽",
+                    fontsize=7, color=col, alpha=0.8)
+
+    ax.axhline(1.0, color="#555", ls=":", lw=0.8, alpha=0.5)
+    ax.set(xlabel="Minute", ylabel="Cumulative xG",
+           title="Cumulative xG Timeline")
+    ax.title.set_color(TEXT_COLOR)
+    ax.legend(fontsize=9, facecolor=PANEL_BG, labelcolor=TEXT_COLOR, edgecolor="#444")
+    ax.grid(alpha=0.2)
+
+
+def match_report_figure(match_graphs: list, match_probs: np.ndarray,
+                         home_team: str, away_team: str) -> plt.Figure:
+    """
+    4-panel match report:
+      Row 0: [home shot map] [away shot map] [KPI text panel]
+      Row 1: [cumulative xG timeline — full width]
+    """
+    home_mask  = np.array([g.team_name == home_team for g in match_graphs])
+    away_mask  = ~home_mask
+    home_graphs = [g for g, m in zip(match_graphs, home_mask) if m]
+    away_graphs = [g for g, m in zip(match_graphs, away_mask) if m]
+    home_probs  = match_probs[home_mask]
+    away_probs  = match_probs[away_mask]
+
+    home_kpi = _match_kpis(home_graphs, home_probs)
+    away_kpi = _match_kpis(away_graphs, away_probs)
+
+    fig = plt.figure(figsize=(16, 10), facecolor=DARK_BG)
+    gs  = fig.add_gridspec(2, 3, height_ratios=[1.6, 1.0], hspace=0.38, wspace=0.28)
+    ax_home     = fig.add_subplot(gs[0, 0])
+    ax_away     = fig.add_subplot(gs[0, 1])
+    ax_kpi      = fig.add_subplot(gs[0, 2])
+    ax_timeline = fig.add_subplot(gs[1, :])
+
+    # Shot maps
+    _draw_shot_map_on_ax(ax_home, home_graphs, home_probs,
+                          f"{home_team or 'Home'} shots")
+    _draw_shot_map_on_ax(ax_away, away_graphs, away_probs,
+                          f"{away_team or 'Away'} shots")
+
+    # KPI panel
+    ax_kpi.set_facecolor(PANEL_BG)
+    ax_kpi.axis("off")
+    lines = [
+        ("", "#aaa"),
+        (f"{'Metric':<14}  {'Home':>8}  {'Away':>8}", "#888"),
+        ("─" * 34, "#555"),
+        (f"{'Shots':<14}  {home_kpi['shots']:>8}  {away_kpi['shots']:>8}", TEXT_COLOR),
+        (f"{'Goals':<14}  {home_kpi['goals']:>8}  {away_kpi['goals']:>8}", "#66BB6A"),
+        (f"{'xG (model)':<14}  {home_kpi['xG_hybrid']:>8.2f}  {away_kpi['xG_hybrid']:>8.2f}", "#4FC3F7"),
+        (f"{'xG (SB)':<14}  {home_kpi['xG_sb']:>8.2f}  {away_kpi['xG_sb']:>8.2f}", "#FFD54F"),
+    ]
+    for i, (line, color) in enumerate(lines):
+        ax_kpi.text(0.05, 0.88 - i * 0.13, line, transform=ax_kpi.transAxes,
+                    fontsize=9.5, color=color, fontfamily="monospace",
+                    verticalalignment="top")
+
+    # Timeline
+    ax_timeline.set_facecolor(PANEL_BG)
+    _draw_cumulative_xg(ax_timeline, match_graphs, match_probs, home_team, away_team)
+
+    return fig
 
 
 # ── Drawing helpers ───────────────────────────────────────────────────────────
@@ -354,6 +542,7 @@ def freeze_frame_figure(graph, hybrid_xg, shot_index, total,
     angle_d = np.degrees(graph.shot_angle.item())
     header  = bool(graph.is_header.item())
     op      = bool(graph.is_open_play.item())
+    tech_label = TECHNIQUE_NAMES.get(int(graph.technique.argmax().item()), "Normal")
 
     models  = ["StatsBomb xG\n(industry)", "HybridGCN\n(our model)"]
     values  = [sb_xg, hybrid_xg]
@@ -376,6 +565,7 @@ def freeze_frame_figure(graph, hybrid_xg, shot_index, total,
         f"Distance  {dist_m:.1f} m",
         f"Angle     {angle_d:.1f}°",
         f"Type      {'Header' if header else 'Foot'}",
+        f"Technique {tech_label}",
         f"Situation {'Open play' if op else 'Set piece'}",
         f"n players {graph.x.shape[0]}",
     ]
@@ -432,13 +622,21 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    view = st.radio("View", ["📍 Shot Map", "🔬 Shot Inspector", "📊 xG Distributions"])
+    view = st.radio("View", ["📍 Shot Map", "🔬 Shot Inspector", "📊 xG Distributions", "📋 Match Report"])
+
+    st.markdown("---")
+
+    # Match selector — only shown in Match Report view
+    match_id_sel = None
+    if view == "📋 Match Report":
+        st.markdown("**Match**")
+        _match_index_placeholder = st.empty()  # filled after data loads
 
     st.markdown("---")
     st.markdown(
-        "**Model:** HybridGCN (GCN encoder + shot metadata)  \n"
-        "**AUC:** 0.752 pooled · 0.760 cross-gender  \n"
-        "**vs StatsBomb xG:** 0.794  \n"
+        "**Model:** HybridGCN (GCN + dist/angle/header/technique)  \n"
+        "**Val AUC:** 0.790  ·  **Test AUC:** 0.751  \n"
+        "**vs StatsBomb xG:** 0.773  \n"
         "**Data:** 326 matches · 7 competitions"
     )
 
@@ -613,6 +811,31 @@ elif view == "🔬 Shot Inspector":
                 st.session_state["_rank"] = shot_rank + 1
 
 
+elif view == "📋 Match Report":
+    match_index = build_match_index(comp_key)
+    if not match_index:
+        st.warning("No match data found. Ensure graphs were built with the latest build_shot_graphs.py.")
+    else:
+        with _match_index_placeholder:
+            match_id_sel = st.selectbox(
+                "Match",
+                options=list(match_index.keys()),
+                format_func=lambda mid: match_index[mid]["label"],
+                key="match_selector",
+            )
+        entry        = match_index[match_id_sel]
+        home_team    = entry["home_team"]
+        away_team    = entry["away_team"]
+
+        st.markdown(f"### {home_team or 'Home'} vs {away_team or 'Away'}")
+
+        with st.spinner("Generating match report…"):
+            m_probs = get_match_predictions(entry["graphs"])
+
+        fig = match_report_figure(entry["graphs"], m_probs, home_team, away_team)
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+
 elif view == "📊 xG Distributions":
     st.markdown("### xG Distributions — Goals vs Misses")
     fig = xg_distribution_figure(graphs, hybrid_probs)
@@ -637,6 +860,6 @@ elif view == "📊 xG Distributions":
     st.markdown(
         "**Note on calibration:** HybridGCN over-assigns probability to goals (mean xG for goals = "
         f"{hybrid_probs[labels==1].mean():.2f} vs StatsBomb's {sb_xgs[labels==1].mean():.2f}). "
-        "This is a known limitation: without shot technique data, the model compensates with "
-        "higher spatial confidence. Adding `shot_technique` as a feature is the next experiment."
+        "The model now includes `shot_technique` as an 8-dim one-hot feature. "
+        "Next experiment: temperature scaling to fix residual over-confidence."
     )

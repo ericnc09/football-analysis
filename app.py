@@ -937,7 +937,7 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    view = st.radio("View", ["📍 Shot Map", "🔬 Shot Inspector", "📊 xG Distributions", "📋 Match Report", "🌟 Surprise Goals"])
+    view = st.radio("View", ["📍 Shot Map", "🔬 Shot Inspector", "📊 xG Distributions", "📋 Match Report", "🌟 Surprise Goals", "👤 Player Profile"])
 
     st.markdown("---")
 
@@ -1076,6 +1076,32 @@ if view == "📍 Shot Map":
         fig = shot_map_figure(sm_graphs, sm_probs, title=map_title)
         st.pyplot(fig, use_container_width=True)
         plt.close(fig)
+        # CSV export of currently filtered shots
+        if len(sm_graphs) > 0:
+            import pandas as pd
+            export_rows = []
+            for g, p in zip(sm_graphs, sm_probs):
+                tech_idx = int(g.technique.argmax().item())
+                export_rows.append({
+                    "player":    g.player_name or "Unknown",
+                    "team":      g.team_name   or "—",
+                    "minute":    int(g.minute.item()) if hasattr(g, "minute") else 0,
+                    "outcome":   "Goal" if int(g.y.item()) == 1 else "Miss",
+                    "xG_model":  round(float(p), 4),
+                    "xG_sb":     round(float(g.sb_xg.item()), 4),
+                    "dist_m":    round(float(g.shot_dist.item()), 2),
+                    "angle_rad": round(float(g.shot_angle.item()), 4),
+                    "is_header": int(g.is_header.item()),
+                    "technique": TECHNIQUE_NAMES.get(tech_idx, "Normal"),
+                })
+            csv_bytes = pd.DataFrame(export_rows).to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="⬇ Download shots CSV",
+                data=csv_bytes,
+                file_name=f"shots_{comp_key}_{sm_team.replace(' ','_')}.csv",
+                mime="text/csv",
+                key="shotmap_csv_dl",
+            )
 
     with col_r:
         sm_labels = labels[sm_mask]
@@ -1607,4 +1633,189 @@ elif view == "🌟 Surprise Goals":
                     f"from {most_surprising.shot_dist.item():.1f} m."
                     f"</div>",
                     unsafe_allow_html=True,
+                )
+
+
+elif view == "👤 Player Profile":
+    import pandas as pd
+
+    st.markdown("### 👤 Player xG Profile — Individual Shot Quality")
+    st.caption(
+        "Per-player aggregated stats across all shots in this competition. "
+        "xG overperformance = Goals − model xG (positive = beating the model)."
+    )
+
+    # ── Build per-player stats ─────────────────────────────────────────────────
+    player_stats: dict[str, dict] = {}
+    for g, p in zip(graphs, hybrid_probs):
+        name = g.player_name or "Unknown"
+        team = g.team_name   or "—"
+        if name not in player_stats:
+            player_stats[name] = {
+                "team": team, "shots": 0, "goals": 0,
+                "xG_model": 0.0, "xG_sb": 0.0, "dist_sum": 0.0,
+            }
+        s = player_stats[name]
+        s["shots"]    += 1
+        s["goals"]    += int(g.y.item())
+        s["xG_model"] += float(p)
+        s["xG_sb"]    += float(g.sb_xg.item())
+        s["dist_sum"] += float(g.shot_dist.item())
+
+    rows = []
+    for name, s in player_stats.items():
+        if s["shots"] == 0:
+            continue
+        overperf = s["goals"] - s["xG_model"]
+        rows.append({
+            "Player":           name,
+            "Team":             s["team"],
+            "Shots":            s["shots"],
+            "Goals":            s["goals"],
+            "xG (model)":       round(s["xG_model"], 2),
+            "xG (SB)":          round(s["xG_sb"],    2),
+            "Goals − xG":       round(overperf,       2),
+            "Avg dist (m)":     round(s["dist_sum"] / s["shots"], 1),
+            "Conv %":           round(100 * s["goals"] / s["shots"], 1),
+        })
+
+    df_players = pd.DataFrame(rows)
+    if df_players.empty:
+        st.info("No player data available for this competition.")
+    else:
+        # ── Sort & filter controls ─────────────────────────────────────────────
+        pc1, pc2, pc3 = st.columns([1, 1, 1])
+        with pc1:
+            sort_col = st.selectbox(
+                "Sort by",
+                ["Goals − xG", "xG (model)", "Goals", "Shots", "Avg dist (m)", "Conv %"],
+                key="player_sort",
+            )
+        with pc2:
+            min_shots = st.slider("Min shots", 1, 10, 3, key="player_min_shots")
+        with pc3:
+            team_filter = st.selectbox(
+                "Filter team",
+                ["All teams"] + sorted(df_players["Team"].unique().tolist()),
+                key="player_team_filter",
+            )
+
+        df_show = df_players[df_players["Shots"] >= min_shots].copy()
+        if team_filter != "All teams":
+            df_show = df_show[df_show["Team"] == team_filter]
+        df_show = df_show.sort_values(sort_col, ascending=False).reset_index(drop=True)
+
+        if df_show.empty:
+            st.warning("No players match the current filters.")
+        else:
+            # ── Summary KPIs ───────────────────────────────────────────────────
+            pk1, pk2, pk3 = st.columns(3)
+            with pk1:
+                st.markdown(f"""<div class="metric-card">
+                    <div class="metric-label">Players shown</div>
+                    <div class="metric-value">{len(df_show)}</div>
+                </div>""", unsafe_allow_html=True)
+            with pk2:
+                top_scorer = df_show.iloc[0]
+                st.markdown(f"""<div class="metric-card green">
+                    <div class="metric-label">Top by {sort_col}</div>
+                    <div class="metric-value" style="font-size:14px">{top_scorer['Player']}</div>
+                    <div class="metric-sub">{top_scorer[sort_col]}</div>
+                </div>""", unsafe_allow_html=True)
+            with pk3:
+                over_count = int((df_show["Goals − xG"] > 0).sum())
+                st.markdown(f"""<div class="metric-card gold">
+                    <div class="metric-label">Overperforming model</div>
+                    <div class="metric-value">{over_count}</div>
+                    <div class="metric-sub">of {len(df_show)} players</div>
+                </div>""", unsafe_allow_html=True)
+
+            st.markdown("---")
+
+            col_chart, col_table = st.columns([1.2, 1])
+
+            # ── Scatter: xG vs Goals, coloured by overperformance ─────────────
+            with col_chart:
+                top_n = min(20, len(df_show))
+                df_plot = df_show.head(top_n)
+
+                fig_p, ax_p = plt.subplots(figsize=(7, 5.5), facecolor=DARK_BG)
+                ax_p.set_facecolor(PANEL_BG)
+
+                overperf_vals = df_plot["Goals − xG"].values
+                norm_op = plt.Normalize(overperf_vals.min(), overperf_vals.max())
+                colors_p = plt.cm.RdYlGn(norm_op(overperf_vals))
+
+                ax_p.scatter(df_plot["xG (model)"], df_plot["Goals"],
+                             c=colors_p, s=110, alpha=0.85, zorder=4, edgecolors="#333", lw=0.5)
+
+                # Diagonal = perfect calibration (Goals == xG)
+                max_val = max(df_plot["xG (model)"].max(), df_plot["Goals"].max()) * 1.1
+                ax_p.plot([0, max_val], [0, max_val], "--", color="#666", lw=1.2,
+                          label="Goals = xG", zorder=2)
+
+                # Label top-5 overperformers and top-5 underperformers
+                label_mask = (df_plot["Goals − xG"].rank(ascending=False) <= 3) | \
+                             (df_plot["Goals − xG"].rank(ascending=True)  <= 3)
+                for _, row in df_plot[label_mask].iterrows():
+                    ax_p.annotate(
+                        row["Player"].split()[-1],  # surname only
+                        (row["xG (model)"], row["Goals"]),
+                        xytext=(5, 3), textcoords="offset points",
+                        fontsize=6.5, color=TEXT_COLOR, alpha=0.85,
+                        bbox=dict(boxstyle="round,pad=0.15", fc=DARK_BG, ec="none", alpha=0.6),
+                    )
+
+                ax_p.set(xlabel="Total xG (model)", ylabel="Goals scored",
+                         title=f"Goals vs xG  (top {top_n} players by {sort_col})")
+                ax_p.title.set_color(TEXT_COLOR)
+                ax_p.tick_params(colors=TEXT_COLOR)
+                ax_p.grid(alpha=0.2)
+                ax_p.legend(fontsize=8, facecolor=PANEL_BG, labelcolor=TEXT_COLOR,
+                            edgecolor="#444")
+
+                sm_p = plt.cm.ScalarMappable(cmap="RdYlGn", norm=norm_op)
+                sm_p.set_array([])
+                cbar_p = fig_p.colorbar(sm_p, ax=ax_p, fraction=0.03, pad=0.02)
+                cbar_p.set_label("Goals − xG", color=TEXT_COLOR, fontsize=8)
+                cbar_p.ax.yaxis.set_tick_params(color=TEXT_COLOR)
+                plt.setp(cbar_p.ax.yaxis.get_ticklabels(), color=TEXT_COLOR, fontsize=7)
+
+                plt.tight_layout()
+                st.pyplot(fig_p, use_container_width=True)
+                plt.close(fig_p)
+
+            # ── Sortable data table with download ─────────────────────────────
+            with col_table:
+                st.markdown(
+                    "<p style='font-size:13px;font-weight:700;color:#e0e0e0;"
+                    "margin-bottom:6px'>Player stats table</p>",
+                    unsafe_allow_html=True,
+                )
+
+                # Colour-code Goals − xG column by styling
+                def _style_overperf(val):
+                    try:
+                        v = float(val)
+                        if v > 0.5:   return "color: #66BB6A; font-weight: bold"
+                        if v < -0.5:  return "color: #EF5350; font-weight: bold"
+                        return "color: #e0e0e0"
+                    except Exception:
+                        return ""
+
+                df_styled = df_show[["Player","Team","Shots","Goals",
+                                     "xG (model)","Goals − xG","Avg dist (m)"]].style.applymap(
+                    _style_overperf, subset=["Goals − xG"]
+                )
+                st.dataframe(df_styled, use_container_width=True,
+                             height=min(40 + 35 * len(df_show), 550))
+
+                # ── CSV download ───────────────────────────────────────────────
+                csv_bytes = df_show.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    label="⬇ Download player stats CSV",
+                    data=csv_bytes,
+                    file_name=f"player_xg_{comp_key}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
                 )

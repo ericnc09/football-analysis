@@ -4,7 +4,7 @@ Graph Neural Network (GNN) research applied to football (soccer). Players are mo
 
 ![Football GNN Dashboard — Shot Map · Freeze Frame · Gradient Saliency · xG Comparison](assets/dashboard_hero.png)
 
-> **HybridGCN achieves Val AUC 0.790** on 8,013 shots across 7 StatsBomb 360 competitions after adding shot technique features — reaching 96% of StatsBomb's proprietary xG (0.773 AUC) using only free, open data. Gradient-saliency edges show *which players most influenced each xG prediction*.
+> **HybridGAT+T achieves AUC 0.763 · Brier 0.159** on 8,013 shots across 7 StatsBomb 360 competitions — trained with 18-dim metadata (technique, GK positioning, defensive blocking, foot preference) and post-hoc temperature scaling. Reaches 96% of StatsBomb's proprietary xG AUC using only free, open data.
 
 ---
 
@@ -12,7 +12,18 @@ Graph Neural Network (GNN) research applied to football (soccer). Players are mo
 
 ![Match Report — Germany vs Japan · Shot maps · KPI table · Cumulative xG timeline](assets/match_report_screenshot.png)
 
-The **Match Report** tab delivers a full per-match breakdown: side-by-side home/away shot maps coloured by HybridGCN xG, a KPI table (shots, goals, model xG, StatsBomb xG), and a cumulative xG step-function timeline with goal markers — select any match from any of the 7 competitions in the sidebar.
+The **Match Report** tab delivers a full per-match breakdown: side-by-side home/away shot maps coloured by HybridGAT xG, a KPI table (shots, goals, model xG, StatsBomb xG), and a cumulative xG step-function timeline with goal markers — select any match from any of the 7 competitions in the sidebar.
+
+### Dashboard tabs
+
+| Tab | What it shows |
+|---|---|
+| 📍 **Shot Map** | Half-pitch heat map of all shots coloured by HybridGAT xG; filter by outcome (goals/misses) or team; team KPI card; top-10 xG list; most surprising goals sidebar |
+| 🔬 **Shot Inspector** | Full freeze-frame of every visible player at shot moment; gradient-saliency overlay (which players influenced the GCN most) or GAT attention overlay (top-3 player pairs attended to); xG comparison bar |
+| 📊 **xG Distributions** | Goal vs miss histograms; reliability diagram (calibration curve); Brier score comparison table |
+| 📋 **Match Report** | 4-panel report: home/away shot maps, KPI text, cumulative xG timeline; analyst narrative with executive summary and shot-by-shot log |
+| 🌟 **Surprise Goals** | Goals rated < 15% xG by the model — worldies, deflections, and individual brilliance; ranked pitch map + table with player/team/minute |
+| 👤 **Player Profile** | Per-player shots/goals/xG/overperformance aggregated across the competition; scatter of Goals vs xG; sortable/filterable table; CSV download |
 
 ## Goal
 
@@ -232,6 +243,29 @@ y  pass_completion (0=complete, 1=failed)  ← StatsBomb experiments
 
 ---
 
+### Experiment 9 — Precision Features + HybridGAT with Temperature Scaling (all 7 comps pooled)
+
+**Task:** Add 3 precision metadata features to reduce systematic variance vs StatsBomb xG; retrain both HybridGCN and HybridGAT with the expanded 18-dim metadata vector; apply per-model temperature scaling (T learned via LBFGS on NLL).
+
+**New features:**
+- `gk_perp_offset` — perpendicular distance of the goalkeeper from the shooter→goal centre line (metres). A GK at 0 perfectly blocks the direct path; 3+ m = exposed.
+- `n_def_direct_line` — count of outfield defenders within a strict ≤3° half-angle cone directly between shooter and goal centre.
+- `is_right_foot` — right-foot binary flag derived from StatsBomb `shot_body_part`; acts as a weak-foot penalty proxy in spatial context.
+
+**Data:** 8,013 shot graphs · 7 competitions · 836 goals (10.4%) · META_DIM expanded 15 → 18
+
+| Model | AUC | Avg Precision | Brier | T |
+|---|---|---|---|---|
+| **StatsBomb xG** | **0.794** | **0.432** | **0.076** | — |
+| **HybridGAT + T-scaling** | **0.763** | **0.351** | **0.159** | 0.775 |
+| HybridGCN + T-scaling | 0.760 | 0.350 | 0.171 | 0.854 |
+| LogReg (dist + angle + header) | 0.743 | 0.301 | 0.190 | — |
+| GCN (spatial only) | 0.655 | 0.166 | 0.232 | — |
+
+**Takeaway:** The 3 precision features lift HybridGAT AUC from 0.752 → 0.763 (+0.011) and cut Brier from 0.178 → 0.159 (−11%). Temperature values T < 1 reveal the models were slightly *under-confident* overall (logits too compressed), and T-scaling correctly sharpens them. HybridGAT now outperforms HybridGCN on both metrics — the GATv2 attention mechanism learns which defender/GK interactions matter most for each shot.
+
+---
+
 ## Summary Table — All Experiments
 
 | # | Task | Train Data | Test n | Best Model | AUC | Notes |
@@ -242,8 +276,9 @@ y  pass_completion (0=complete, 1=failed)  ← StatsBomb experiments
 | 4 | Pass completion (cross-comp) | WC2022 64 matches | 7,591 | GAT | **0.672** | Maintained across domain shift |
 | 5 | xG pure GNN (in-comp) | WC2022 shots | 212 | GAT | 0.593 | Small data; LogReg wins (0.799) |
 | 6 | xG pure GNN (cross-comp) | WC2022→WWC2023 | 1,589 | GCN | 0.603 | LogReg wins (0.764) |
-| 7 | xG Hybrid (all 7 comps pooled) | 8,013 shots | 1,192 | **HybridGCN** | **0.751** | Val AUC 0.790 w/ technique ✓ |
+| 7 | xG Hybrid (all 7 comps pooled) | 8,013 shots | 1,203 | **HybridGCN** | **0.760** | Technique + GK features; Brier 0.171 |
 | 8 | xG Hybrid (men → women) | 4,793→3,220 | 3,220 | **HybridGCN** | **0.760** | Near-ties LogReg (0.765) |
+| 9 | xG HybridGAT + T-scaling (all 7 comps) | 8,013 shots | 1,203 | **HybridGAT+T** | **0.763** | 18-dim meta, T=0.775, Brier 0.159 ↓ |
 
 ---
 
@@ -256,8 +291,17 @@ y  pass_completion (0=complete, 1=failed)  ← StatsBomb experiments
 - [x] **xG model** — benchmark GNN vs StatsBomb xG and logistic regression
 - [x] **All StatsBomb 360 data** — scale to all 326 matches across 7 competitions (8,013 shots)
 - [x] **Hybrid xG model** — GCN embedding + shot metadata → MLP head; beats LogReg at scale
-- [x] **Shot technique features** — add 8-dim one-hot technique to metadata; val AUC 0.790 (↑ from 0.752)
-- [ ] **GAT attention visualization** — plot which player pairs the model attends to for predicted failures
+- [x] **Shot technique features** — add 8-dim one-hot technique to metadata; AUC +0.008
+- [x] **Precision features** — `gk_perp_offset`, `n_def_direct_line`, `is_right_foot`; META_DIM 15 → 18
+- [x] **Temperature scaling** — post-hoc LBFGS calibration; HybridGAT+T Brier 0.178 → 0.159
+- [x] **GAT attention overlay** — top-3 player pairs the model attends to, visualised in Shot Inspector
+- [x] **Surprise Goals detector** — dedicated tab for goals below 15% xG (worldies & deflections)
+- [x] **Player xG Profile** — per-player aggregated shots/goals/xG/overperformance table + scatter
+- [x] **CSV export** — download filtered shots or player stats from any view
+- [ ] **Edge features for GATv2** — add relative distance + angle as edge attributes (expected +0.01–0.02 AUC)
+- [ ] **Per-competition temperature** — one T per competition label to reduce systematic bias
+- [ ] **Shot placement feature** — StatsBomb `shot_placement` one-hot (9 bins, high-value predictor)
+- [ ] **More data** — La Liga 2015/16, NWSL; target 12,000+ shots for better Brier convergence
 - [ ] **Node-level prediction** — predict pass destination (which player receives), not just outcome
 - [ ] **Temporal GNNs** — use sequence of 5 frames before a shot/pass to capture player momentum
 - [ ] **Formation classifier** — cluster position snapshots into tactical shapes (4-4-2, 4-3-3, etc.)
@@ -320,6 +364,12 @@ python scripts/train_xg_hybrid.py \
   --test  data/processed/statsbomb_wwc2023_shot_graphs.pt \
           data/processed/statsbomb_weuro2022_shot_graphs.pt \
           data/processed/statsbomb_weuro2025_shot_graphs.pt
+
+# 13. Temperature scaling is fitted automatically at end of train_xg_hybrid.py
+#     Saved to: data/processed/pool_7comp_T.pt (GCN) and pool_7comp_gat_T.pt (GAT)
+#
+#     Launch the Streamlit dashboard:
+streamlit run app.py
 ```
 
 ## Stack

@@ -59,6 +59,10 @@ PROCESSED_DIR = REPO_ROOT / "data" / "processed"
 GOAL_X = (120 / 120) * PITCH_LENGTH   # 105.0 m
 GOAL_Y = (40  /  80) * PITCH_WIDTH    # 34.0 m
 
+# Goal-post y-coordinates (goal width = 7.32 m, centred at y=34)
+GOAL_POST_LEFT  = np.array([GOAL_X, GOAL_Y - 3.66], dtype=np.float32)
+GOAL_POST_RIGHT = np.array([GOAL_X, GOAL_Y + 3.66], dtype=np.float32)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -77,6 +81,109 @@ def _fetch_frames(match_id: int) -> dict:
         except Exception:
             time.sleep(2 ** attempt)
     return {}
+
+
+def _point_in_triangle(p: np.ndarray, a: np.ndarray,
+                       b: np.ndarray, c: np.ndarray) -> bool:
+    """Return True if point p lies inside triangle abc (2-D)."""
+    def _sign(p1, p2, p3):
+        return (p1[0] - p3[0]) * (p2[1] - p3[1]) - (p2[0] - p3[0]) * (p1[1] - p3[1])
+    d1, d2, d3 = _sign(p, a, b), _sign(p, b, c), _sign(p, c, a)
+    has_neg = (d1 < 0) or (d2 < 0) or (d3 < 0)
+    has_pos = (d1 > 0) or (d2 > 0) or (d3 > 0)
+    return not (has_neg and has_pos)
+
+
+def _gk_pressure_features(freeze_frame: list, shot_loc: list) -> dict:
+    """
+    Compute goalkeeper-pressure features directly from the StatsBomb freeze frame.
+
+    Features
+    --------
+    gk_dist          : Euclidean distance (m) from shooter to GK.
+                       Default 35.0 if no GK found.
+    n_def_in_cone    : Count of outfield defenders inside the shooting cone
+                       (triangle: shooter → left post → right post).
+    gk_off_centre    : Absolute lateral displacement of GK from the goal
+                       centre-line, normalised by half-goal-width (3.66 m).
+                       0 = perfectly centred, 1 = on a post, >1 = off far post.
+    gk_perp_offset   : Perpendicular distance (m) of the GK from the straight
+                       line connecting the shooter to the goal centre.
+                       0 = GK perfectly on the shot line (best position),
+                       large = GK is way off the direct shot path (easy to score).
+    n_def_direct_line: Count of defenders within a ≤3° half-angle cone pointing
+                       from the shooter directly at goal centre, and between the
+                       shooter and the goal. Stricter than n_def_in_cone; captures
+                       defenders who are literally blocking the straight shot.
+    """
+    sx, sy = normalise_statsbomb(*shot_loc)
+    shooter  = np.array([sx, sy], dtype=np.float32)
+    shot_dir = np.array([GOAL_X - sx, GOAL_Y - sy], dtype=np.float32)  # shooter→goal
+    shot_len = float(np.linalg.norm(shot_dir))
+
+    gk_pos = None
+    def_positions: list[np.ndarray] = []
+
+    for p in freeze_frame:
+        if p.get("actor", False):
+            continue  # skip the shooter himself
+        x_m, y_m = normalise_statsbomb(*p["location"])
+        pos = np.array([x_m, y_m], dtype=np.float32)
+        if p.get("keeper", False):
+            gk_pos = pos
+        elif not p.get("teammate", True):   # opposing outfield player
+            def_positions.append(pos)
+
+    # ── GK metrics ────────────────────────────────────────────────────────────
+    if gk_pos is not None:
+        gk_dist       = float(np.linalg.norm(shooter - gk_pos))
+        gk_off_centre = float(abs(gk_pos[1] - GOAL_Y) / 3.66)
+        # Perpendicular distance from GK to the shooter→goal-centre line
+        # = |cross(shot_dir, shooter→gk)| / |shot_dir|
+        if shot_len > 0.1:
+            to_gk = gk_pos - shooter
+            cross = shot_dir[0] * to_gk[1] - shot_dir[1] * to_gk[0]
+            gk_perp_offset = float(abs(cross) / shot_len)
+        else:
+            gk_perp_offset = 0.0
+    else:
+        gk_dist        = 35.0   # sensible default when GK absent from freeze frame
+        gk_off_centre  = 0.0
+        gk_perp_offset = 3.0   # assume GK is off the line (penalty-area average)
+
+    # ── Defenders inside wide shooting cone (triangle to posts) ───────────────
+    n_def_in_cone = 0
+    for dp in def_positions:
+        if _point_in_triangle(dp, shooter, GOAL_POST_LEFT, GOAL_POST_RIGHT):
+            n_def_in_cone += 1
+
+    # ── Defenders in the narrow direct-shot line (≤3° half-angle) ────────────
+    # A defender counts only if they are (a) between shooter and goal and
+    # (b) within 3° of the straight shooter→goal-centre direction.
+    n_def_direct_line = 0
+    if shot_len > 0.1:
+        for dp in def_positions:
+            to_def     = dp - shooter
+            dist_to_def = float(np.linalg.norm(to_def))
+            if dist_to_def < 0.5:
+                continue   # ignore players right on top of shooter
+            # Projection scalar along the shot direction (0=shooter, 1=goal)
+            proj = float(np.dot(to_def, shot_dir) / (shot_len ** 2))
+            if proj <= 0.0 or proj > 1.1:
+                continue   # behind shooter or well past goal
+            # Angle between shot direction and direction to defender
+            cos_a     = float(np.dot(to_def, shot_dir) / (dist_to_def * shot_len))
+            angle_deg = float(np.degrees(np.arccos(np.clip(cos_a, -1.0, 1.0))))
+            if angle_deg <= 3.0:
+                n_def_direct_line += 1
+
+    return {
+        "gk_dist":           gk_dist,
+        "n_def_in_cone":     float(n_def_in_cone),
+        "gk_off_centre":     gk_off_centre,
+        "gk_perp_offset":    gk_perp_offset,
+        "n_def_direct_line": float(n_def_direct_line),
+    }
 
 
 def _shot_distance_angle(shot_loc: list) -> tuple[float, float]:
@@ -99,7 +206,8 @@ def build_shot_graph(freeze_frame: list, label: float,
                      minute: int = 0,
                      player_name: str = "",
                      team_name: str = "",
-                     home_team: str = "") -> Data:
+                     home_team: str = "",
+                     body_part: str = "") -> Data:
     """Convert a StatsBomb 360 shot freeze frame into a PyG Data object."""
     positions, teams = [], []
     for p in freeze_frame:
@@ -122,6 +230,13 @@ def build_shot_graph(freeze_frame: list, label: float,
     edge_attr_np  = _compute_edge_features(positions, teams, edge_index_np)
 
     dist_m, angle_rad = _shot_distance_angle(shot_loc)
+    gk_feats          = _gk_pressure_features(freeze_frame, shot_loc)
+
+    # Body-part flag: 1 = right foot, 0 = left foot / header / other
+    # Used as a weak-foot proxy: combined with spatial context the model
+    # can learn that right-foot shots from the left channel (and vice-versa)
+    # are harder — without needing explicit preferred-foot lookup.
+    is_right_foot = 1.0 if "Right" in body_part else 0.0
 
     data = Data(
         x          = torch.tensor(x_feat,        dtype=torch.float),
@@ -135,7 +250,15 @@ def build_shot_graph(freeze_frame: list, label: float,
         is_header    = torch.tensor([float(is_header)],     dtype=torch.float),
         is_open_play = torch.tensor([float(is_open_play)],  dtype=torch.float),
         # shot technique (8-dim one-hot: 0=unknown, 1-7=named techniques)
-        technique    = torch.tensor(encode_technique(technique), dtype=torch.float),
+        technique      = torch.tensor(encode_technique(technique), dtype=torch.float),
+        # goalkeeper-pressure features — original 3
+        gk_dist        = torch.tensor([gk_feats["gk_dist"]],       dtype=torch.float),
+        n_def_in_cone  = torch.tensor([gk_feats["n_def_in_cone"]], dtype=torch.float),
+        gk_off_centre  = torch.tensor([gk_feats["gk_off_centre"]], dtype=torch.float),
+        # NEW: 3 additional precision features (META_DIM 15 → 18)
+        gk_perp_offset    = torch.tensor([gk_feats["gk_perp_offset"]],    dtype=torch.float),
+        n_def_direct_line = torch.tensor([gk_feats["n_def_direct_line"]], dtype=torch.float),
+        is_right_foot     = torch.tensor([is_right_foot],                 dtype=torch.float),
         # match-level context (for per-match report)
         match_id     = torch.tensor([match_id],  dtype=torch.long),
         minute       = torch.tensor([minute],    dtype=torch.long),
@@ -202,6 +325,7 @@ def process_match(match_id: int, home_team: str = "") -> tuple[list, dict]:
                 ff, label, sb_xg, shot_loc, is_header, is_open_play,
                 technique=technique, match_id=match_id, minute=minute,
                 player_name=player_name, team_name=team_name, home_team=home_team,
+                body_part=body_part,
             )
             graph = enrich_graph(graph, attacking_right=True, pressure_radius=5.0)
             dataset.append(graph)

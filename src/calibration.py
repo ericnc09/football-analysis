@@ -209,16 +209,37 @@ class TemperatureScaler(nn.Module):
 
 def _default_meta(batch, device: str) -> torch.Tensor:
     """
-    Build the standard 12-dim metadata tensor for HybridXGModel.
+    Build the standard 18-dim metadata tensor for HybridXGModel.
     Mirrors _metadata_tensor() in train_xg_hybrid.py.
 
-    Layout: [shot_dist, shot_angle, is_header, is_open_play, technique×8]
+    Layout: [shot_dist, shot_angle, is_header, is_open_play, technique×8,
+             gk_dist, n_def_in_cone, gk_off_centre,
+             gk_perp_offset, n_def_direct_line, is_right_foot]
     """
+    n = batch.shot_dist.shape[0]
+
     base = torch.stack([
         batch.shot_dist.squeeze(),
         batch.shot_angle.squeeze(),
         batch.is_header.squeeze().float(),
         batch.is_open_play.squeeze().float(),
-    ], dim=1)                           # [n, 4]
-    tech = batch.technique.view(-1, 8)  # [n, 8]
-    return torch.cat([base, tech], dim=1).to(device)  # [n, 12]
+    ], dim=1)                              # [n, 4]
+    tech = batch.technique.view(-1, 8)    # [n, 8]
+    gk   = torch.stack([
+        batch.gk_dist.squeeze(),
+        batch.n_def_in_cone.squeeze(),
+        batch.gk_off_centre.squeeze(),
+    ], dim=1)                              # [n, 3]
+
+    def _safe(attr, default):
+        if hasattr(batch, attr):
+            return getattr(batch, attr).squeeze()
+        return torch.full((n,), default)
+
+    new = torch.stack([
+        _safe("gk_perp_offset",    3.0),
+        _safe("n_def_direct_line", 0.0),
+        _safe("is_right_foot",     0.5),
+    ], dim=1)                              # [n, 3]
+
+    return torch.cat([base, tech, gk, new], dim=1).to(device)  # [n, 18]

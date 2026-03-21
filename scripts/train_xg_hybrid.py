@@ -69,7 +69,9 @@ EPOCHS = 120
 BATCH  = 64
 LR     = 1e-3
 WD     = 1e-4
-META_DIM = 12  # shot_dist, shot_angle, is_header, is_open_play + technique (8-dim one-hot)
+META_DIM = 18  # shot_dist, shot_angle, is_header, is_open_play + technique×8
+               # + gk_dist, n_def_in_cone, gk_off_centre          (original 3)
+               # + gk_perp_offset, n_def_direct_line, is_right_foot (new 3)
 
 
 # ---------------------------------------------------------------------------
@@ -272,15 +274,40 @@ def train_standard_gnn(ModelClass, kwargs, train_g, val_g, pos_weight, label):
 # ---------------------------------------------------------------------------
 
 def _metadata_tensor(batch) -> torch.Tensor:
-    """Stack per-graph metadata features into [n_graphs, META_DIM=12]."""
+    """Stack per-graph metadata features into [n_graphs, META_DIM=18].
+
+    Layout
+    ------
+    [0]    shot_dist          metres, ~0-50
+    [1]    shot_angle         radians, 0-π/2
+    [2]    is_header          0/1
+    [3]    is_open_play       0/1
+    [4:12] technique          8-dim one-hot
+    [12]   gk_dist            metres, shooter→GK Euclidean distance
+    [13]   n_def_in_cone      defenders in wide shooting-cone triangle (goal posts)
+    [14]   gk_off_centre      GK lateral displacement / half-goal-width
+    [15]   gk_perp_offset     GK perpendicular distance (m) from shooter→goal line
+    [16]   n_def_direct_line  defenders in ≤3° cone, directly in shot path
+    [17]   is_right_foot      1=right foot, 0=left/header (weak-foot proxy)
+    """
     base = torch.stack([
         batch.shot_dist.squeeze(),
         batch.shot_angle.squeeze(),
         batch.is_header.squeeze().float(),
         batch.is_open_play.squeeze().float(),
-    ], dim=1)                          # [n, 4]
-    tech = batch.technique.view(-1, 8) # [n, 8]
-    return torch.cat([base, tech], dim=1).to(DEVICE)  # [n, 12]
+    ], dim=1)                              # [n, 4]
+    tech = batch.technique.view(-1, 8)    # [n, 8]
+    gk   = torch.stack([
+        batch.gk_dist.squeeze(),
+        batch.n_def_in_cone.squeeze(),
+        batch.gk_off_centre.squeeze(),
+    ], dim=1)                              # [n, 3]
+    new  = torch.stack([
+        batch.gk_perp_offset.squeeze(),
+        batch.n_def_direct_line.squeeze(),
+        batch.is_right_foot.squeeze(),
+    ], dim=1)                              # [n, 3]
+    return torch.cat([base, tech, gk, new], dim=1).to(DEVICE)  # [n, 18]
 
 
 def train_epoch_hybrid(model, loader, optimizer, pos_weight):

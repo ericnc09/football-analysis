@@ -68,7 +68,8 @@ MODEL_PATH     = PROCESSED / "pool_7comp_hybrid_xg.pt"
 TEMP_PATH      = PROCESSED / "pool_7comp_T.pt"          # GCN temperature scalar
 GAT_MODEL_PATH = PROCESSED / "pool_7comp_hybrid_gat_xg.pt"
 GAT_TEMP_PATH  = PROCESSED / "pool_7comp_gat_T.pt"      # GAT temperature scalar
-META_DIM       = 12  # shot_dist, shot_angle, is_header, is_open_play + technique (8-dim one-hot)
+META_DIM       = 15  # shot_dist, shot_angle, is_header, is_open_play + technique×8 + gk_dist, n_def_in_cone, gk_off_centre
+SURPRISE_XG_THRESHOLD = 0.15   # goals below this are "worldies"
 
 # Technique index → display name
 TECHNIQUE_NAMES: dict[int, str] = {v: k.title() for k, v in TECHNIQUE_INDEX.items()}
@@ -91,7 +92,7 @@ GOAL_X, GOAL_Y = PL, PW / 2
 
 # ── Model definition (mirrors train_xg_hybrid.py) ────────────────────────────
 class HybridXGModel(nn.Module):
-    def __init__(self, in_channels=9, hidden_dim=64, meta_dim=META_DIM, dropout=0.3):
+    def __init__(self, in_channels=9, hidden_dim=64, meta_dim=15, dropout=0.3):
         super().__init__()
         self.convs = nn.ModuleList([
             GCNConv(in_channels, hidden_dim),
@@ -127,6 +128,10 @@ def compute_node_saliency(model, graph):
     importance : np.ndarray, shape [n_nodes]
         Importance score per player; higher = more influential.
     """
+    # Resolve actual meta_dim: check TemperatureScaler wrapper first, then bare model
+    _scaler = load_model()
+    meta_dim = getattr(_scaler, "_meta_dim", 15)
+
     model.eval()
     x = graph.x.clone().detach().float().requires_grad_(True)
     ei = graph.edge_index
@@ -136,9 +141,25 @@ def compute_node_saliency(model, graph):
         float(graph.shot_angle.item()),
         float(graph.is_header.item()),
         float(graph.is_open_play.item()),
-    ]])                                        # [1, 4]
-    tech = graph.technique.unsqueeze(0)        # [1, 8]
-    meta = torch.cat([base, tech], dim=1)      # [1, 12]
+    ]])                                              # [1, 4]
+    tech = graph.technique.unsqueeze(0)              # [1, 8]
+    if meta_dim >= 15:
+        gk   = torch.tensor([[
+            float(graph.gk_dist.item()) if hasattr(graph, "gk_dist") else 20.0,
+            float(graph.n_def_in_cone.item()) if hasattr(graph, "n_def_in_cone") else 0.0,
+            float(graph.gk_off_centre.item()) if hasattr(graph, "gk_off_centre") else 0.0,
+        ]])                                              # [1, 3]
+        if meta_dim >= 18:
+            new = torch.tensor([[
+                float(graph.gk_perp_offset.item()) if hasattr(graph, "gk_perp_offset") else 3.0,
+                float(graph.n_def_direct_line.item()) if hasattr(graph, "n_def_direct_line") else 0.0,
+                float(graph.is_right_foot.item()) if hasattr(graph, "is_right_foot") else 0.5,
+            ]])                                          # [1, 3]
+            meta = torch.cat([base, tech, gk, new], dim=1)  # [1, 18]
+        else:
+            meta = torch.cat([base, tech, gk], dim=1)   # [1, 15]
+    else:
+        meta = torch.cat([base, tech], dim=1)            # [1, 12]
 
     logit = model(x, ei, batch, meta)
     pred  = torch.sigmoid(logit).squeeze()
@@ -170,19 +191,40 @@ def compute_gat_attention(gat_model, graph) -> tuple[np.ndarray, np.ndarray] | N
     # The gat_model is TemperatureScaler-wrapped; access the inner HybridGATModel
     inner = gat_model.model if isinstance(gat_model, TemperatureScaler) else gat_model
 
+    # Infer the meta_dim the model was actually trained with from its head layer.
+    # head[0] = Linear(pool_dim + meta_dim, pool_dim)
+    actual_meta_dim = inner.head[0].in_features - inner._pool_dim
+
     inner.eval()
     x        = graph.x.clone().detach().float()
     ei       = graph.edge_index
     batch_v  = torch.zeros(graph.x.shape[0], dtype=torch.long)
-    meta     = torch.cat([
-        torch.tensor([[
-            float(graph.shot_dist.item()),
-            float(graph.shot_angle.item()),
-            float(graph.is_header.item()),
-            float(graph.is_open_play.item()),
-        ]]),
-        graph.technique.unsqueeze(0),   # [1, 8]
-    ], dim=1)                           # [1, 12]
+
+    base = torch.tensor([[
+        float(graph.shot_dist.item()),
+        float(graph.shot_angle.item()),
+        float(graph.is_header.item()),
+        float(graph.is_open_play.item()),
+    ]])                                  # [1, 4]
+    tech = graph.technique.unsqueeze(0)  # [1, 8]
+
+    if actual_meta_dim >= 15:
+        gk = torch.tensor([[
+            float(graph.gk_dist.item()) if hasattr(graph, "gk_dist") else 20.0,
+            float(graph.n_def_in_cone.item()) if hasattr(graph, "n_def_in_cone") else 0.0,
+            float(graph.gk_off_centre.item()) if hasattr(graph, "gk_off_centre") else 0.0,
+        ]])                              # [1, 3]
+        if actual_meta_dim >= 18:
+            new = torch.tensor([[
+                float(graph.gk_perp_offset.item()) if hasattr(graph, "gk_perp_offset") else 3.0,
+                float(graph.n_def_direct_line.item()) if hasattr(graph, "n_def_direct_line") else 0.0,
+                float(graph.is_right_foot.item()) if hasattr(graph, "is_right_foot") else 0.5,
+            ]])                          # [1, 3]
+            meta = torch.cat([base, tech, gk, new], dim=1)  # [1, 18]
+        else:
+            meta = torch.cat([base, tech, gk], dim=1)       # [1, 15]
+    else:
+        meta = torch.cat([base, tech], dim=1)                # [1, 12]
 
     with torch.no_grad():
         _, alphas = inner.forward_with_attention(x, ei, batch_v, meta)
@@ -199,13 +241,22 @@ def compute_gat_attention(gat_model, graph) -> tuple[np.ndarray, np.ndarray] | N
 # ── Cached loaders ────────────────────────────────────────────────────────────
 @st.cache_resource
 def load_model():
-    """Load HybridGCN + temperature scalar. Returns TemperatureScaler-wrapped model."""
-    base = HybridXGModel()
-    base.load_state_dict(torch.load(MODEL_PATH, weights_only=True, map_location="cpu"))
+    """Load HybridGCN + temperature scalar. Returns TemperatureScaler-wrapped model.
+
+    Auto-detects meta_dim from the checkpoint so it works regardless of whether
+    the model was trained with meta_dim=12 (base+technique) or 15 (+GK features).
+    head.0.weight shape = (hidden_dim, hidden_dim + meta_dim)  → hidden_dim = 64
+    """
+    ckpt = torch.load(MODEL_PATH, weights_only=True, map_location="cpu")
+    hidden_dim      = 64   # HybridXGModel default hidden_dim
+    actual_meta_dim = int(ckpt["head.0.weight"].shape[1]) - hidden_dim
+    base = HybridXGModel(meta_dim=actual_meta_dim)
+    base.load_state_dict(ckpt)
     base.eval()
-    # Wrap with temperature scaler (falls back to T=1.0 if no T file yet)
     scaler = TemperatureScaler.load(base, TEMP_PATH)
     scaler.eval()
+    # Stash meta_dim so callers don't have to re-derive it
+    scaler._meta_dim = actual_meta_dim
     return scaler
 
 
@@ -225,8 +276,12 @@ def load_gat_model():
         # edge_dim: convs.0.lin_edge exists only when edge_dim > 0
         edge_dim = (ckpt["convs.0.lin_edge.weight"].shape[1]
                     if "convs.0.lin_edge.weight" in ckpt else 0)
+        # Auto-detect meta_dim from saved head weights:
+        # head.0 = Linear(pool_dim + meta_dim, pool_dim); pool_dim = hidden = 32
+        _pool_dim = 32
+        actual_meta_dim = int(ckpt["head.0.weight"].shape[1]) - _pool_dim
         gat = HybridGATModel(node_in=node_in, edge_dim=edge_dim,
-                             meta_dim=META_DIM, hidden=32, heads=4,
+                             meta_dim=actual_meta_dim, hidden=32, heads=4,
                              n_layers=3, dropout=0.3)
         gat.load_state_dict(ckpt)
         gat.eval()
@@ -245,16 +300,50 @@ def load_competition(key: str):
     return torch.load(path, weights_only=False)
 
 
-def _build_meta(batch) -> torch.Tensor:
-    """Build 12-dim metadata tensor for a PyG batch."""
+def _build_meta(batch, meta_dim: int = 18) -> torch.Tensor:
+    """Build metadata tensor for a PyG batch.
+
+    Handles all historical meta_dim sizes:
+      12 = base(4) + technique(8)
+      15 = 12 + gk_original(3)
+      18 = 15 + gk_precision(3)   ← current target
+    Falls back gracefully when newer attributes are missing from old graphs.
+    """
+    n = batch.shot_dist.shape[0]
+
     base = torch.stack([
         batch.shot_dist.squeeze(),
         batch.shot_angle.squeeze(),
         batch.is_header.squeeze().float(),
         batch.is_open_play.squeeze().float(),
-    ], dim=1)                          # [n, 4]
-    tech = batch.technique.view(-1, 8) # [n, 8]
-    return torch.cat([base, tech], dim=1)  # [n, 12]
+    ], dim=1)                              # [n, 4]
+    tech = batch.technique.view(-1, 8)    # [n, 8]
+
+    if meta_dim < 15:
+        return torch.cat([base, tech], dim=1)   # [n, 12]
+
+    gk = torch.stack([
+        batch.gk_dist.squeeze(),
+        batch.n_def_in_cone.squeeze(),
+        batch.gk_off_centre.squeeze(),
+    ], dim=1)                              # [n, 3]
+
+    if meta_dim < 18:
+        return torch.cat([base, tech, gk], dim=1)   # [n, 15]
+
+    # New precision features — safe fallback for old graphs lacking the attrs
+    def _safe(attr, default):
+        if hasattr(batch, attr):
+            return getattr(batch, attr).squeeze()
+        return torch.full((n,), default)
+
+    new = torch.stack([
+        _safe("gk_perp_offset",    3.0),   # metres; 3.0 = GK slightly off line
+        _safe("n_def_direct_line", 0.0),   # count
+        _safe("is_right_foot",     0.5),   # unknown → neutral 0.5
+    ], dim=1)                              # [n, 3]
+
+    return torch.cat([base, tech, gk, new], dim=1)   # [n, 18]
 
 
 @st.cache_resource
@@ -262,12 +351,13 @@ def get_predictions(key: str):
     graphs = load_competition(key)
     if not graphs:
         return np.array([])
-    model = load_model()   # TemperatureScaler-wrapped; forward() applies T
-    loader = DataLoader(graphs, batch_size=256, shuffle=False)
+    model    = load_model()   # TemperatureScaler-wrapped; forward() applies T
+    meta_dim = getattr(model, "_meta_dim", 15)
+    loader   = DataLoader(graphs, batch_size=256, shuffle=False)
     probs = []
     with torch.no_grad():
         for batch in loader:
-            meta   = _build_meta(batch)
+            meta   = _build_meta(batch, meta_dim)
             logits = model(batch.x, batch.edge_index, batch.batch, meta)
             probs.extend(torch.sigmoid(logits.squeeze()).tolist())
     return np.array(probs)
@@ -302,11 +392,12 @@ def build_match_index(key: str) -> dict:
 
 def get_match_predictions(match_graphs: list) -> np.ndarray:
     """Run inference on a match-scoped list of graphs. Returns probs array (N,)."""
-    model  = load_model()   # T-scaled
-    loader = DataLoader(match_graphs, batch_size=len(match_graphs), shuffle=False)
+    model    = load_model()   # T-scaled
+    meta_dim = getattr(model, "_meta_dim", 15)
+    loader   = DataLoader(match_graphs, batch_size=len(match_graphs), shuffle=False)
     with torch.no_grad():
         batch  = next(iter(loader))
-        meta   = _build_meta(batch)
+        meta   = _build_meta(batch, meta_dim)
         logits = model(batch.x, batch.edge_index, batch.batch, meta)
         probs  = torch.sigmoid(logits.squeeze()).numpy()
     return np.atleast_1d(probs)
@@ -708,6 +799,100 @@ def freeze_frame_figure(graph, hybrid_xg, shot_index, total,
     return fig
 
 
+def reliability_diagram_figure(graphs, probs_cal, n_bins=10):
+    """
+    Reliability diagram (calibration curve) + Brier score bar chart.
+
+    Left panel  — predicted xG bucket vs actual conversion rate.
+                  A perfectly calibrated model hugs the diagonal.
+    Right panel — Brier score comparison: HybridGCN+T vs StatsBomb xG.
+    """
+    from sklearn.metrics import brier_score_loss
+
+    labels_np = np.array([int(g.y.item()) for g in graphs])
+    sb_probs  = np.array([g.sb_xg.item() for g in graphs])
+    bins      = np.linspace(0, 1, n_bins + 1)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), facecolor=DARK_BG)
+
+    # ── Left: calibration curves ─────────────────────────────────────────────
+    ax = axes[0]
+    ax.set_facecolor(PANEL_BG)
+
+    for probs, name, color, marker in [
+        (probs_cal, "HybridGCN + T-scaling", "#4FC3F7", "o"),
+        (sb_probs,  "StatsBomb xG",          "#FFD54F", "s"),
+    ]:
+        centers, fracs, counts = [], [], []
+        for i in range(n_bins):
+            mask = (probs >= bins[i]) & (probs < bins[i + 1])
+            if mask.sum() >= 5:
+                centers.append((bins[i] + bins[i + 1]) / 2)
+                fracs.append(float(labels_np[mask].mean()))
+                counts.append(int(mask.sum()))
+
+        if centers:
+            ax.plot(centers, fracs, f"{marker}-", color=color, lw=2.2, ms=7,
+                    label=name, zorder=4)
+            # Histogram silhouette at bottom showing sample density
+            ax.bar(centers, [c / max(counts) * 0.07 for c in counts],
+                   width=0.07, bottom=0.0, color=color, alpha=0.18,
+                   zorder=2, align="center")
+
+    # Perfect calibration diagonal
+    ax.plot([0, 1], [0, 1], "--", color="#888", lw=1.3,
+            label="Perfect calibration", zorder=3)
+    ax.fill_between([0, 1], [0, 1], 1.05,
+                    alpha=0.06, color="#EF5350", label="Over-confident zone")
+    ax.fill_between([0, 1], 0, [0, 1],
+                    alpha=0.06, color="#4FC3F7", label="Under-confident zone")
+
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_ylim(-0.02, 1.05)
+    ax.set(xlabel="Predicted xG (model output)",
+           ylabel="Actual conversion rate",
+           title="Reliability Diagram — Calibration Curve")
+    ax.title.set_color(TEXT_COLOR)
+    ax.legend(fontsize=8.5, facecolor=PANEL_BG, labelcolor=TEXT_COLOR,
+              edgecolor="#444", loc="upper left")
+    ax.grid(alpha=0.2)
+    ax.tick_params(colors=TEXT_COLOR)
+
+    # ── Right: Brier score bar chart ─────────────────────────────────────────
+    ax2 = axes[1]
+    ax2.set_facecolor(PANEL_BG)
+
+    model_names = ["HybridGCN + T", "StatsBomb xG"]
+    brier_vals  = [
+        brier_score_loss(labels_np, probs_cal),
+        brier_score_loss(labels_np, sb_probs),
+    ]
+    bar_colors = ["#4FC3F7", "#FFD54F"]
+
+    bars = ax2.barh(model_names, brier_vals, color=bar_colors,
+                    alpha=0.85, height=0.4, edgecolor="#333")
+    for bar, val in zip(bars, brier_vals):
+        ax2.text(val + 0.001, bar.get_y() + bar.get_height() / 2,
+                 f"{val:.4f}", va="center", ha="left",
+                 fontsize=13, fontweight="bold", color=TEXT_COLOR)
+
+    ax2.axvline(0.10, color="#66BB6A", ls="--", lw=1.2, alpha=0.8,
+                label="Target ≤ 0.100")
+    ax2.set_xlim(0, max(brier_vals) * 1.3)
+    ax2.set(xlabel="Brier Score  (lower = better, max = 1.0)",
+            title="Calibration Quality — Brier Score")
+    ax2.title.set_color(TEXT_COLOR)
+    ax2.legend(fontsize=8.5, facecolor=PANEL_BG, labelcolor=TEXT_COLOR,
+               edgecolor="#444")
+    ax2.grid(axis="x", alpha=0.2)
+    ax2.tick_params(colors=TEXT_COLOR)
+
+    fig.suptitle("Model Calibration", color=TEXT_COLOR,
+                 fontsize=12, fontweight="bold", y=1.01)
+    plt.tight_layout()
+    return fig
+
+
 def xg_distribution_figure(graphs, hybrid_probs):
     """Side-by-side histograms: Hybrid vs StatsBomb xG, goals vs misses."""
     fig, axes = plt.subplots(1, 2, figsize=(11, 4), facecolor=DARK_BG)
@@ -752,7 +937,7 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    view = st.radio("View", ["📍 Shot Map", "🔬 Shot Inspector", "📊 xG Distributions", "📋 Match Report"])
+    view = st.radio("View", ["📍 Shot Map", "🔬 Shot Inspector", "📊 xG Distributions", "📋 Match Report", "🌟 Surprise Goals"])
 
     st.markdown("---")
 
@@ -763,11 +948,23 @@ with st.sidebar:
         _match_index_placeholder = st.empty()  # filled after data loads
 
     st.markdown("---")
+    _scaler_sb = load_model()
+    _T_sb = _scaler_sb.temperature if isinstance(_scaler_sb, TemperatureScaler) else 1.0
+    _gat_sb, _gat_avail_sb = load_gat_model()
+    _T_gat = _gat_sb.temperature if (_gat_avail_sb and isinstance(_gat_sb, TemperatureScaler)) else "—"
     st.markdown(
         "**Model:** HybridGCN (GCN + dist/angle/header/technique)  \n"
         "**Val AUC:** 0.790  ·  **Test AUC:** 0.751  \n"
         "**vs StatsBomb xG:** 0.773  \n"
         "**Data:** 326 matches · 7 competitions"
+    )
+    st.markdown("---")
+    _T_gat_str = f"{_T_gat:.3f}" if isinstance(_T_gat, float) else str(_T_gat)
+    st.markdown(
+        f"🌡️ **Temperature scaling**  \n"
+        f"GCN  T = `{_T_sb:.3f}`  \n"
+        f"GAT  T = `{_T_gat_str}`  \n"
+        f"*(T > 1 → squeezes over-confident probs)*"
     )
 
 
@@ -825,31 +1022,113 @@ st.markdown("---")
 
 if view == "📍 Shot Map":
     st.markdown("### Shot Map — HybridGCN xG")
-    st.caption("★ = goal  ·  ● = miss  ·  colour = HybridGCN predicted xG  ·  green=high, red=low")
+
+    # ── Filters row ───────────────────────────────────────────────────────────
+    sm_f1, sm_f2, sm_f3 = st.columns([1, 1.6, 2.4])
+
+    with sm_f1:
+        sm_outcome = st.selectbox(
+            "Outcome", ["All shots", "Goals only", "Misses only"],
+            key="shotmap_outcome",
+        )
+
+    # Build team list from the loaded competition
+    _all_teams = sorted(set(g.team_name for g in graphs if g.team_name))
+    with sm_f2:
+        sm_team = st.selectbox(
+            "Team / Country",
+            options=["All teams"] + _all_teams,
+            key="shotmap_team",
+        )
+
+    # Apply outcome filter first
+    if sm_outcome == "Goals only":
+        sm_mask = labels == 1
+    elif sm_outcome == "Misses only":
+        sm_mask = labels == 0
+    else:
+        sm_mask = np.ones(len(graphs), dtype=bool)
+
+    # Apply team filter on top
+    if sm_team != "All teams":
+        team_mask = np.array([g.team_name == sm_team for g in graphs])
+        sm_mask   = sm_mask & team_mask
+
+    sm_graphs = [g for g, m in zip(graphs, sm_mask) if m]
+    sm_probs  = hybrid_probs[sm_mask]
+    sm_labels = labels[sm_mask]
+
+    sm_n = int(sm_mask.sum())
+    sm_g = int((sm_labels == 1).sum())
+
+    with sm_f3:
+        map_title = (
+            f"{sm_team} — {COMPETITIONS[comp_key]}"
+            if sm_team != "All teams" else COMPETITIONS[comp_key]
+        )
+        st.caption(
+            f"Showing **{sm_n}** shots  ·  **{sm_g}** goals  ·  "
+            "★ = goal  ·  ● = miss  ·  colour = HybridGCN xG  ·  green=high, red=low"
+        )
 
     col_l, col_r = st.columns([3, 1])
     with col_l:
-        fig = shot_map_figure(graphs, hybrid_probs, title=COMPETITIONS[comp_key])
+        fig = shot_map_figure(sm_graphs, sm_probs, title=map_title)
         st.pyplot(fig, use_container_width=True)
         plt.close(fig)
 
     with col_r:
+        sm_labels = labels[sm_mask]
+        # ── Team KPI card (shown only when a specific team is selected) ──────
+        if sm_team != "All teams" and len(sm_graphs) > 0:
+            conv_rate = sm_g / sm_n * 100 if sm_n else 0
+            xg_total  = float(sm_probs.sum())
+            xg_sb     = float(sum(g.sb_xg.item() for g in sm_graphs))
+            avg_dist  = float(np.mean([g.shot_dist.item() for g in sm_graphs]))
+            xg_diff   = sm_g - xg_total
+            diff_col  = "#66BB6A" if xg_diff >= 0 else "#EF5350"
+            diff_lbl  = f"+{xg_diff:.2f}" if xg_diff >= 0 else f"{xg_diff:.2f}"
+            st.markdown(
+                f"<div style='background:#1a1a2e;border-radius:8px;padding:12px 14px;"
+                f"border-left:4px solid #4FC3F7;margin-bottom:10px;font-size:12px;color:#ccc'>"
+                f"<b style='color:#e0e0e0;font-size:13px'>{sm_team}</b><br>"
+                f"<span style='color:#888'>Shots</span> <b style='color:#e0e0e0'>{sm_n}</b> &nbsp;·&nbsp; "
+                f"<span style='color:#888'>Goals</span> <b style='color:#66BB6A'>{sm_g}</b> &nbsp;·&nbsp; "
+                f"<span style='color:#888'>Conv.</span> <b style='color:#e0e0e0'>{conv_rate:.1f}%</b><br>"
+                f"<span style='color:#888'>xG model</span> <b style='color:#4FC3F7'>{xg_total:.2f}</b> &nbsp;·&nbsp; "
+                f"<span style='color:#888'>xG SB</span> <b style='color:#FFD54F'>{xg_sb:.2f}</b><br>"
+                f"<span style='color:#888'>Goals − xG</span> <b style='color:{diff_col}'>{diff_lbl}</b> &nbsp;·&nbsp; "
+                f"<span style='color:#888'>Avg dist</span> <b style='color:#e0e0e0'>{avg_dist:.1f} m</b>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown("<div style='margin:6px 0;border-top:1px solid #333'></div>",
+                        unsafe_allow_html=True)
+
+        # ── Top 10 highest xG shots ───────────────────────────────────────────
         st.markdown(
             "<p style='font-size:13px;font-weight:700;color:#e0e0e0;"
             "margin-bottom:6px'>🎯 Top 10 highest xG shots</p>",
             unsafe_allow_html=True,
         )
-        top_idx = np.argsort(hybrid_probs)[::-1][:10]
+        top_idx = np.argsort(sm_probs)[::-1][:10]
         for rank, i in enumerate(top_idx):
-            g    = graphs[i]
-            icon = "⚽" if labels[i] else "<span style='color:#EF5350'>✗</span>"
-            dist = g.shot_dist.item()
-            xg   = hybrid_probs[i]
+            g     = sm_graphs[i]
+            icon  = "⚽" if sm_labels[i] else "<span style='color:#EF5350'>✗</span>"
+            dist  = g.shot_dist.item()
+            xg    = sm_probs[i]
+            # Show team name when in "All teams" mode
+            team_tag = (
+                f"<span style='font-size:9px;color:#666;min-width:60px;overflow:hidden;"
+                f"text-overflow:ellipsis;white-space:nowrap'>{g.team_name}</span>"
+                if sm_team == "All teams" else ""
+            )
             bar_w = int(xg * 60)
             st.markdown(
                 f"<div style='display:flex;align-items:center;margin-bottom:5px;gap:6px'>"
                 f"<span style='color:#888;font-size:10px;width:18px'>#{rank+1}</span>"
                 f"<span style='font-size:13px'>{icon}</span>"
+                f"{team_tag}"
                 f"<div style='flex:1;background:#1a1a2e;border-radius:3px;height:14px'>"
                 f"<div style='width:{bar_w}px;background:#4FC3F7;border-radius:3px;height:14px'></div></div>"
                 f"<span style='font-size:12px;font-weight:700;color:#e0e0e0;min-width:36px'>{xg:.3f}</span>"
@@ -857,29 +1136,39 @@ if view == "📍 Shot Map":
                 f"</div>",
                 unsafe_allow_html=True,
             )
-        st.markdown("<div style='margin:10px 0;border-top:1px solid #333'></div>",
-                    unsafe_allow_html=True)
-        st.markdown(
-            "<p style='font-size:13px;font-weight:700;color:#e0e0e0;"
-            "margin-bottom:4px'>😮 Most surprising goals</p>"
-            "<p style='font-size:10px;color:#888;margin-bottom:6px'>Goals model rated lowest</p>",
-            unsafe_allow_html=True,
-        )
-        goal_idxs = np.where(labels == 1)[0]
-        surprise  = goal_idxs[np.argsort(hybrid_probs[goal_idxs])[:8]]
-        for i in surprise:
-            dist = graphs[i].shot_dist.item()
-            xg   = hybrid_probs[i]
+
+        # ── Surprising goals (only when goals visible) ────────────────────────
+        goal_idxs_sm = np.where(sm_labels == 1)[0]
+        if len(goal_idxs_sm) > 0:
+            st.markdown("<div style='margin:10px 0;border-top:1px solid #333'></div>",
+                        unsafe_allow_html=True)
             st.markdown(
-                f"<div style='display:flex;align-items:center;margin-bottom:5px;gap:6px'>"
-                f"<span style='font-size:13px'>⚽</span>"
-                f"<div style='flex:1;background:#1a1a2e;border-radius:3px;height:14px'>"
-                f"<div style='width:{int(xg*60)}px;background:#EF5350;border-radius:3px;height:14px'></div></div>"
-                f"<span style='font-size:12px;font-weight:700;color:#e0e0e0;min-width:36px'>{xg:.3f}</span>"
-                f"<span style='font-size:10px;color:#888;min-width:30px'>{dist:.0f}m</span>"
-                f"</div>",
+                "<p style='font-size:13px;font-weight:700;color:#e0e0e0;"
+                "margin-bottom:4px'>😮 Most surprising goals</p>"
+                "<p style='font-size:10px;color:#888;margin-bottom:6px'>Goals model rated lowest</p>",
                 unsafe_allow_html=True,
             )
+            surprise = goal_idxs_sm[np.argsort(sm_probs[goal_idxs_sm])[:8]]
+            for i in surprise:
+                g    = sm_graphs[i]
+                dist = g.shot_dist.item()
+                xg   = sm_probs[i]
+                team_tag = (
+                    f"<span style='font-size:9px;color:#666;min-width:60px;overflow:hidden;"
+                    f"text-overflow:ellipsis;white-space:nowrap'>{g.team_name}</span>"
+                    if sm_team == "All teams" else ""
+                )
+                st.markdown(
+                    f"<div style='display:flex;align-items:center;margin-bottom:5px;gap:6px'>"
+                    f"<span style='font-size:13px'>⚽</span>"
+                    f"{team_tag}"
+                    f"<div style='flex:1;background:#1a1a2e;border-radius:3px;height:14px'>"
+                    f"<div style='width:{int(xg*60)}px;background:#EF5350;border-radius:3px;height:14px'></div></div>"
+                    f"<span style='font-size:12px;font-weight:700;color:#e0e0e0;min-width:36px'>{xg:.3f}</span>"
+                    f"<span style='font-size:10px;color:#888;min-width:30px'>{dist:.0f}m</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
 
 
 elif view == "🔬 Shot Inspector":
@@ -988,6 +1277,8 @@ elif view == "🔬 Shot Inspector":
 
 
 elif view == "📋 Match Report":
+    import pandas as pd
+
     match_index = build_match_index(comp_key)
     if not match_index:
         st.warning("No match data found. Ensure graphs were built with the latest build_shot_graphs.py.")
@@ -999,18 +1290,138 @@ elif view == "📋 Match Report":
                 format_func=lambda mid: match_index[mid]["label"],
                 key="match_selector",
             )
-        entry        = match_index[match_id_sel]
-        home_team    = entry["home_team"]
-        away_team    = entry["away_team"]
+        entry     = match_index[match_id_sel]
+        home_team = entry["home_team"]
+        away_team = entry["away_team"]
+        mg        = entry["graphs"]
 
         st.markdown(f"### {home_team or 'Home'} vs {away_team or 'Away'}")
 
         with st.spinner("Generating match report…"):
-            m_probs = get_match_predictions(entry["graphs"])
+            m_probs = get_match_predictions(mg)
 
-        fig = match_report_figure(entry["graphs"], m_probs, home_team, away_team)
+        # ── Visual 4-panel ────────────────────────────────────────────────────
+        fig = match_report_figure(mg, m_probs, home_team, away_team)
         st.pyplot(fig, use_container_width=True)
         plt.close(fig)
+
+        st.markdown("---")
+
+        # ── Analyst narrative section ─────────────────────────────────────────
+        home_mask = np.array([g.team_name == home_team for g in mg])
+        away_mask = ~home_mask
+
+        def _team_stats(mask):
+            gs   = [mg[i] for i in range(len(mg)) if mask[i]]
+            prbs = m_probs[mask]
+            goals = [g for g in gs if int(g.y.item()) == 1]
+            return {
+                "shots":    len(gs),
+                "goals":    len(goals),
+                "xG":       float(prbs.sum()),
+                "xG_sb":    float(sum(g.sb_xg.item() for g in gs)),
+                "on_target": sum(1 for g in gs if int(g.y.item()) == 1
+                                 or g.sb_xg.item() > 0.05),
+                "avg_dist": float(np.mean([g.shot_dist.item() for g in gs])) if gs else 0,
+                "avg_gk_d": float(np.mean([g.gk_dist.item() for g in gs
+                                            if hasattr(g, "gk_dist")])) if gs else float("nan"),
+                "surprise_goals": [
+                    (g, p) for g, p in zip(gs, prbs)
+                    if int(g.y.item()) == 1 and p < SURPRISE_XG_THRESHOLD
+                ],
+                "graphs":   gs,
+                "probs":    prbs,
+            }
+
+        hs = _team_stats(home_mask)
+        as_ = _team_stats(away_mask)
+
+        # Determine performance narrative
+        def _perf_narrative(st_dict):
+            diff = st_dict["goals"] - st_dict["xG"]
+            if diff > 0.5:   return "over-performed their xG"
+            if diff < -0.5:  return "under-performed their xG"
+            return "finished in line with expected goals"
+
+        # Shot quality: high-quality = xG > 0.2
+        def _hq_shots(st_dict):
+            return sum(1 for g, p in zip(st_dict["graphs"], st_dict["probs"]) if p > 0.20)
+
+        st.markdown("#### 📋 Analyst Summary")
+
+        # Executive summary box
+        total_xg_home = hs["xG"]
+        total_xg_away = as_["xG"]
+        xg_winner     = home_team if total_xg_home > total_xg_away else away_team
+        xg_loser      = away_team if total_xg_home > total_xg_away else home_team
+
+        st.markdown(f"""
+<div style='background:#1a1a2e;border-radius:8px;padding:16px 20px;
+            border-left:4px solid #4FC3F7;margin-bottom:16px;font-size:13px;color:#ccc;
+            line-height:1.7'>
+<b style='color:#e0e0e0;font-size:15px'>Executive Summary</b><br><br>
+{xg_winner} dominated the xG battle ({max(total_xg_home, total_xg_away):.2f}) vs
+{xg_loser} ({min(total_xg_home, total_xg_away):.2f}).
+<b style='color:#4FC3F7'>{home_team or "Home"}</b> took {hs['shots']} shots
+(avg distance {hs['avg_dist']:.1f} m) and {_perf_narrative(hs)}.
+<b style='color:#EF5350'>{away_team or "Away"}</b> took {as_['shots']} shots
+(avg distance {as_['avg_dist']:.1f} m) and {_perf_narrative(as_)}.
+{f"<br><br>⚡ <b style='color:#FFD54F'>Surprise goal(s) flagged</b> — " + ", ".join(f"{sg[0].player_name} ({sg[1]:.1%} xG)" for sg in hs['surprise_goals'] + as_['surprise_goals']) + "." if (hs['surprise_goals'] or as_['surprise_goals']) else ""}
+</div>
+""", unsafe_allow_html=True)
+
+        # Side-by-side team stats
+        mc1, mc2 = st.columns(2)
+        for col, team, st_d, colour in [
+            (mc1, home_team or "Home", hs, "#4FC3F7"),
+            (mc2, away_team or "Away", as_, "#EF5350"),
+        ]:
+            with col:
+                st.markdown(
+                    f"<div style='font-size:14px;font-weight:700;color:{colour};"
+                    f"margin-bottom:8px'>{team}</div>",
+                    unsafe_allow_html=True,
+                )
+                rows = [
+                    ("Shots",               st_d["shots"]),
+                    ("Goals",               st_d["goals"]),
+                    ("xG (model)",          f"{st_d['xG']:.2f}"),
+                    ("xG (StatsBomb)",      f"{st_d['xG_sb']:.2f}"),
+                    ("High-quality shots",  _hq_shots(st_d)),
+                    ("Avg shot distance",   f"{st_d['avg_dist']:.1f} m"),
+                    ("Avg GK distance",     f"{st_d['avg_gk_d']:.1f} m" if not np.isnan(st_d['avg_gk_d']) else "—"),
+                    ("Surprise goals",      len(st_d["surprise_goals"])),
+                ]
+                df_team = pd.DataFrame(rows, columns=["Metric", "Value"]).set_index("Metric")
+                st.dataframe(df_team, use_container_width=True)
+
+        # Shot-by-shot log
+        st.markdown("#### 📄 Shot-by-Shot Log")
+        shot_rows = []
+        for i, (g, p) in enumerate(zip(mg, m_probs)):
+            tech_idx = int(g.technique.argmax().item())
+            gk_d = g.gk_dist.item() if hasattr(g, "gk_dist") else float("nan")
+            n_def = int(g.n_def_in_cone.item()) if hasattr(g, "n_def_in_cone") else 0
+            surprise_flag = "⭐" if (int(g.y.item()) == 1 and p < SURPRISE_XG_THRESHOLD) else ""
+            shot_rows.append({
+                "Min":        int(g.minute.item()),
+                "Team":       g.team_name or "—",
+                "Player":     g.player_name or "—",
+                "Outcome":    "⚽ Goal" if int(g.y.item()) == 1 else "✗ Miss",
+                "xG (model)": f"{p:.3f}",
+                "xG (SB)":    f"{g.sb_xg.item():.3f}",
+                "Dist (m)":   f"{g.shot_dist.item():.1f}",
+                "Technique":  TECHNIQUE_NAMES.get(tech_idx, "Normal"),
+                "GK dist":    f"{gk_d:.1f}" if not np.isnan(gk_d) else "—",
+                "Def in cone": n_def,
+                "Flag":       surprise_flag,
+            })
+        shot_rows.sort(key=lambda r: r["Min"])
+        st.dataframe(
+            pd.DataFrame(shot_rows),
+            use_container_width=True,
+            height=min(40 + 35 * len(shot_rows), 500),
+        )
 
 elif view == "📊 xG Distributions":
     st.markdown("### xG Distributions — Goals vs Misses")
@@ -1018,6 +1429,17 @@ elif view == "📊 xG Distributions":
     st.pyplot(fig, use_container_width=True)
     plt.close(fig)
 
+    st.markdown("---")
+    st.markdown("#### 🌡️ Calibration — Reliability Diagram")
+    st.caption(
+        "Left: predicted xG buckets vs actual conversion rate — a well-calibrated model "
+        "hugs the diagonal. Right: Brier score (lower = better)."
+    )
+    fig_cal = reliability_diagram_figure(graphs, hybrid_probs)
+    st.pyplot(fig_cal, use_container_width=True)
+    plt.close(fig_cal)
+
+    st.markdown("---")
     # Summary stats table
     st.markdown("#### Model comparison on this competition")
     from sklearn.metrics import average_precision_score, brier_score_loss
@@ -1052,3 +1474,137 @@ elif view == "📊 xG Distributions":
             f"Goal mean xG: model={hybrid_probs[labels==1].mean():.3f}  ·  "
             f"StatsBomb={sb_xgs[labels==1].mean():.3f}"
         )
+
+
+# ── 🌟 Surprise Goals ─────────────────────────────────────────────────────────
+elif view == "🌟 Surprise Goals":
+    import pandas as pd
+
+    st.markdown("### 🌟 Surprise Goals — Worldies the Model Didn't See Coming")
+    st.caption(
+        f"Goals where HybridGCN xG < {SURPRISE_XG_THRESHOLD:.0%} — "
+        "long-range efforts, deflections, and moments of individual brilliance "
+        "that the model rated as unlikely."
+    )
+
+    # ── Find surprise goals ────────────────────────────────────────────────────
+    goal_mask     = labels == 1
+    surprise_mask = goal_mask & (hybrid_probs < SURPRISE_XG_THRESHOLD)
+    surprise_idx  = np.where(surprise_mask)[0]
+
+    if len(surprise_idx) == 0:
+        st.info(f"No goals below {SURPRISE_XG_THRESHOLD:.0%} xG in this competition. "
+                "Try a different competition or lower the threshold.")
+    else:
+        surprise_idx_sorted = surprise_idx[np.argsort(hybrid_probs[surprise_idx])]
+
+        # ── Summary KPIs ──────────────────────────────────────────────────────
+        kc1, kc2, kc3 = st.columns(3)
+        with kc1:
+            st.markdown(f"""<div class="metric-card red">
+                <div class="metric-label">Surprise Goals</div>
+                <div class="metric-value">{len(surprise_idx)}</div>
+                <div class="metric-sub">of {n_goals} total goals ({100*len(surprise_idx)/max(n_goals,1):.0f}%)</div>
+            </div>""", unsafe_allow_html=True)
+        with kc2:
+            avg_xg = hybrid_probs[surprise_idx].mean()
+            st.markdown(f"""<div class="metric-card">
+                <div class="metric-label">Avg model xG</div>
+                <div class="metric-value">{avg_xg:.3f}</div>
+                <div class="metric-sub">SB avg: {sb_xgs[surprise_idx].mean():.3f}</div>
+            </div>""", unsafe_allow_html=True)
+        with kc3:
+            avg_dist = np.array([graphs[i].shot_dist.item() for i in surprise_idx]).mean()
+            st.markdown(f"""<div class="metric-card gold">
+                <div class="metric-label">Avg shot distance</div>
+                <div class="metric-value">{avg_dist:.1f} m</div>
+                <div class="metric-sub">vs overall avg {np.array([g.shot_dist.item() for g in graphs]).mean():.1f} m</div>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        col_pitch, col_table = st.columns([1.4, 1])
+
+        # ── Pitch map ─────────────────────────────────────────────────────────
+        with col_pitch:
+            fig_s, ax_s = plt.subplots(figsize=(8, 7), facecolor=DARK_BG)
+            pitch_s = VerticalPitch(
+                pitch_type="custom", pitch_length=PL, pitch_width=PW,
+                pitch_color=PANEL_BG, line_color="#555", half=True,
+                goal_type="box", pad_top=2, pad_bottom=2,
+            )
+            pitch_s.draw(ax=ax_s)
+
+            s_probs = hybrid_probs[surprise_idx_sorted]
+            s_x = np.array([graphs[i].x[graphs[i].x[:, 3] == 1][0, 0].item()
+                             for i in surprise_idx_sorted])
+            s_y = np.array([graphs[i].x[graphs[i].x[:, 3] == 1][0, 1].item()
+                             for i in surprise_idx_sorted])
+
+            sc = pitch_s.scatter(s_x, s_y, ax=ax_s,
+                                 c=s_probs, cmap="plasma_r", vmin=0, vmax=SURPRISE_XG_THRESHOLD,
+                                 s=250, alpha=0.9, zorder=5, marker="*",
+                                 edgecolors="white", linewidths=0.8)
+
+            # Label each with rank
+            for rank, (xi, yi) in enumerate(zip(s_x, s_y)):
+                ax_s.text(xi + 1.0, yi, f"#{rank+1}",
+                          fontsize=6.5, color="#FFD54F", alpha=0.9,
+                          fontweight="bold", zorder=7)
+
+            cbar = fig_s.colorbar(sc, ax=ax_s, fraction=0.03, pad=0.02)
+            cbar.set_label("Model xG (lower = more surprising)", color=TEXT_COLOR, fontsize=8)
+            cbar.ax.yaxis.set_tick_params(color=TEXT_COLOR)
+            plt.setp(cbar.ax.yaxis.get_ticklabels(), color=TEXT_COLOR, fontsize=7)
+            ax_s.set_title(
+                f"Surprise Goals (xG < {SURPRISE_XG_THRESHOLD:.0%})  ·  "
+                f"{COMPETITIONS[comp_key]}",
+                color="#FFD54F", fontsize=10, fontweight="bold",
+            )
+            st.pyplot(fig_s, use_container_width=True)
+            plt.close(fig_s)
+
+        # ── Ranked table ──────────────────────────────────────────────────────
+        with col_table:
+            st.markdown(
+                "<p style='font-size:13px;font-weight:700;color:#FFD54F;"
+                "margin-bottom:6px'>Ranked by model xG ↑ (most surprising first)</p>",
+                unsafe_allow_html=True,
+            )
+            rows = []
+            for rank, i in enumerate(surprise_idx_sorted):
+                g = graphs[i]
+                tech_idx  = int(g.technique.argmax().item())
+                tech_name = TECHNIQUE_NAMES.get(tech_idx, "Normal")
+                gk_d      = g.gk_dist.item() if hasattr(g, "gk_dist") else float("nan")
+                rows.append({
+                    "Rank":        f"#{rank+1}",
+                    "Player":      g.player_name or "Unknown",
+                    "Team":        g.team_name   or "—",
+                    "Min":         int(g.minute.item()),
+                    "xG (model)":  f"{hybrid_probs[i]:.3f}",
+                    "xG (SB)":     f"{sb_xgs[i]:.3f}",
+                    "Dist (m)":    f"{g.shot_dist.item():.1f}",
+                    "Technique":   tech_name,
+                    "GK dist (m)": f"{gk_d:.1f}" if not np.isnan(gk_d) else "—",
+                })
+            df = pd.DataFrame(rows).set_index("Rank")
+            st.dataframe(df, use_container_width=True, height=min(40 + 35 * len(rows), 600))
+
+            # Analyst note
+            if len(surprise_idx_sorted) > 0:
+                most_surprising = graphs[surprise_idx_sorted[0]]
+                st.markdown(
+                    f"<div style='margin-top:14px;padding:10px 12px;"
+                    f"background:#1a1a2e;border-left:3px solid #FFD54F;"
+                    f"border-radius:4px;font-size:12px;color:#ccc'>"
+                    f"<b style='color:#FFD54F'>⚡ Most surprising:</b> "
+                    f"{most_surprising.player_name or 'Unknown'} "
+                    f"({most_surprising.team_name or '—'}) "
+                    f"at min. {most_surprising.minute.item()!s} — "
+                    f"model gave only <b style='color:#FFD54F'>"
+                    f"{hybrid_probs[surprise_idx_sorted[0]]:.1%}</b> chance of scoring "
+                    f"from {most_surprising.shot_dist.item():.1f} m."
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )

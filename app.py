@@ -9,6 +9,7 @@ Run:
 """
 
 import sys
+import html as _html
 import warnings
 warnings.filterwarnings("ignore")
 from pathlib import Path
@@ -294,10 +295,15 @@ def load_gat_model():
 
 @st.cache_resource
 def load_competition(key: str):
-    path = PROCESSED / f"statsbomb_{key}_shot_graphs.pt"
+    # Path is constructed entirely from our own PROCESSED directory — never from
+    # user input — so weights_only=False is safe here.  PyG Data objects cannot
+    # be serialised with weights_only=True because they contain custom classes.
+    path = (PROCESSED / f"statsbomb_{key}_shot_graphs.pt").resolve()
+    if not str(path).startswith(str(PROCESSED.resolve())):
+        raise ValueError(f"Path traversal detected: {path}")
     if not path.exists():
         return []
-    return torch.load(path, weights_only=False)
+    return torch.load(path, weights_only=False)  # nosec: trusted internal data only
 
 
 def _build_meta(batch, meta_dim: int = 18) -> torch.Tensor:
@@ -1146,7 +1152,7 @@ if view == "📍 Shot Map":
             # Show team name when in "All teams" mode
             team_tag = (
                 f"<span style='font-size:9px;color:#666;min-width:60px;overflow:hidden;"
-                f"text-overflow:ellipsis;white-space:nowrap'>{g.team_name}</span>"
+                f"text-overflow:ellipsis;white-space:nowrap'>{_html.escape(g.team_name or '')}</span>"
                 if sm_team == "All teams" else ""
             )
             bar_w = int(xg * 60)
@@ -1181,7 +1187,7 @@ if view == "📍 Shot Map":
                 xg   = sm_probs[i]
                 team_tag = (
                     f"<span style='font-size:9px;color:#666;min-width:60px;overflow:hidden;"
-                    f"text-overflow:ellipsis;white-space:nowrap'>{g.team_name}</span>"
+                    f"text-overflow:ellipsis;white-space:nowrap'>{_html.escape(g.team_name or '')}</span>"
                     if sm_team == "All teams" else ""
                 )
                 st.markdown(
@@ -1378,8 +1384,18 @@ elif view == "📋 Match Report":
         # Executive summary box
         total_xg_home = hs["xG"]
         total_xg_away = as_["xG"]
-        xg_winner     = home_team if total_xg_home > total_xg_away else away_team
-        xg_loser      = away_team if total_xg_home > total_xg_away else home_team
+        xg_winner     = _html.escape(home_team if total_xg_home > total_xg_away else away_team)
+        xg_loser      = _html.escape(away_team if total_xg_home > total_xg_away else home_team)
+        _home_esc     = _html.escape(home_team or "Home")
+        _away_esc     = _html.escape(away_team or "Away")
+
+        _surprise_line = ""
+        if hs['surprise_goals'] or as_['surprise_goals']:
+            names = ", ".join(
+                f"{_html.escape(sg[0].player_name or 'Unknown')} ({sg[1]:.1%} xG)"
+                for sg in hs['surprise_goals'] + as_['surprise_goals']
+            )
+            _surprise_line = f"<br><br>⚡ <b style='color:#FFD54F'>Surprise goal(s) flagged</b> — {names}."
 
         st.markdown(f"""
 <div style='background:#1a1a2e;border-radius:8px;padding:16px 20px;
@@ -1388,11 +1404,11 @@ elif view == "📋 Match Report":
 <b style='color:#e0e0e0;font-size:15px'>Executive Summary</b><br><br>
 {xg_winner} dominated the xG battle ({max(total_xg_home, total_xg_away):.2f}) vs
 {xg_loser} ({min(total_xg_home, total_xg_away):.2f}).
-<b style='color:#4FC3F7'>{home_team or "Home"}</b> took {hs['shots']} shots
+<b style='color:#4FC3F7'>{_home_esc}</b> took {hs['shots']} shots
 (avg distance {hs['avg_dist']:.1f} m) and {_perf_narrative(hs)}.
-<b style='color:#EF5350'>{away_team or "Away"}</b> took {as_['shots']} shots
+<b style='color:#EF5350'>{_away_esc}</b> took {as_['shots']} shots
 (avg distance {as_['avg_dist']:.1f} m) and {_perf_narrative(as_)}.
-{f"<br><br>⚡ <b style='color:#FFD54F'>Surprise goal(s) flagged</b> — " + ", ".join(f"{sg[0].player_name} ({sg[1]:.1%} xG)" for sg in hs['surprise_goals'] + as_['surprise_goals']) + "." if (hs['surprise_goals'] or as_['surprise_goals']) else ""}
+{_surprise_line}
 </div>
 """, unsafe_allow_html=True)
 
@@ -1405,7 +1421,7 @@ elif view == "📋 Match Report":
             with col:
                 st.markdown(
                     f"<div style='font-size:14px;font-weight:700;color:{colour};"
-                    f"margin-bottom:8px'>{team}</div>",
+                    f"margin-bottom:8px'>{_html.escape(team)}</div>",
                     unsafe_allow_html=True,
                 )
                 rows = [
@@ -1620,13 +1636,15 @@ elif view == "🌟 Surprise Goals":
             # Analyst note
             if len(surprise_idx_sorted) > 0:
                 most_surprising = graphs[surprise_idx_sorted[0]]
+                _ms_player = _html.escape(most_surprising.player_name or "Unknown")
+                _ms_team   = _html.escape(most_surprising.team_name or "—")
                 st.markdown(
                     f"<div style='margin-top:14px;padding:10px 12px;"
                     f"background:#1a1a2e;border-left:3px solid #FFD54F;"
                     f"border-radius:4px;font-size:12px;color:#ccc'>"
                     f"<b style='color:#FFD54F'>⚡ Most surprising:</b> "
-                    f"{most_surprising.player_name or 'Unknown'} "
-                    f"({most_surprising.team_name or '—'}) "
+                    f"{_ms_player} "
+                    f"({_ms_team}) "
                     f"at min. {most_surprising.minute.item()!s} — "
                     f"model gave only <b style='color:#FFD54F'>"
                     f"{hybrid_probs[surprise_idx_sorted[0]]:.1%}</b> chance of scoring "
@@ -1718,8 +1736,8 @@ elif view == "👤 Player Profile":
             with pk2:
                 top_scorer = df_show.iloc[0]
                 st.markdown(f"""<div class="metric-card green">
-                    <div class="metric-label">Top by {sort_col}</div>
-                    <div class="metric-value" style="font-size:14px">{top_scorer['Player']}</div>
+                    <div class="metric-label">Top by {_html.escape(str(sort_col))}</div>
+                    <div class="metric-value" style="font-size:14px">{_html.escape(str(top_scorer['Player']))}</div>
                     <div class="metric-sub">{top_scorer[sort_col]}</div>
                 </div>""", unsafe_allow_html=True)
             with pk3:

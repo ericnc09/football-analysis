@@ -17,7 +17,7 @@ Usage:
 
 import sys
 import argparse
-import urllib.request
+import requests
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -51,11 +51,18 @@ def download_file(url: str, dest: Path, force: bool = False) -> bool:
     print(f"  [fetch] {dest.name} ... ", end="", flush=True)
 
     try:
-        urllib.request.urlretrieve(url, dest)
+        resp = requests.get(url, timeout=30, stream=True)
+        resp.raise_for_status()
+        with dest.open("wb") as fh:
+            for chunk in resp.iter_content(chunk_size=65536):
+                fh.write(chunk)
         size = dest.stat().st_size
         print(f"OK  ({size/1024:.0f} KB)")
         return True
-    except Exception as e:
+    except requests.exceptions.SSLError as e:
+        print(f"FAILED (SSL) — {e}")
+        raise  # cert failures must not be silently swallowed
+    except (requests.exceptions.RequestException, OSError) as e:
         print(f"FAILED — {e}")
         if dest.exists():
             dest.unlink()

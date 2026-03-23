@@ -70,7 +70,9 @@ def _fetch_json(url: str, retries: int = 3) -> list:
             resp = requests.get(url, timeout=15)
             resp.raise_for_status()
             return resp.json()
-        except Exception as e:
+        except requests.exceptions.SSLError:
+            raise  # never silently retry TLS/cert failures
+        except (requests.exceptions.RequestException, ValueError) as e:
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
             else:
@@ -90,7 +92,7 @@ def load_freeze_frames(match_id: int) -> dict:
     try:
         records = _fetch_json(url)
         return {r["event_uuid"]: r["freeze_frame"] for r in records}
-    except Exception:
+    except RuntimeError:
         return {}
 
 

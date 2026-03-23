@@ -78,7 +78,9 @@ def _fetch_frames(match_id: int) -> dict:
             r = requests.get(url, timeout=15)
             r.raise_for_status()
             return {rec["event_uuid"]: rec["freeze_frame"] for rec in r.json()}
-        except Exception:
+        except requests.exceptions.SSLError:
+            raise  # never silently retry TLS/cert failures
+        except (requests.exceptions.RequestException, ValueError):
             time.sleep(2 ** attempt)
     return {}
 

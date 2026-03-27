@@ -65,11 +65,13 @@ st.markdown("""
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 PROCESSED      = REPO_ROOT / "data" / "processed"
-MODEL_PATH     = PROCESSED / "pool_7comp_hybrid_xg.pt"
-TEMP_PATH      = PROCESSED / "pool_7comp_T.pt"          # GCN temperature scalar
-GAT_MODEL_PATH = PROCESSED / "pool_7comp_hybrid_gat_xg.pt"
-GAT_TEMP_PATH  = PROCESSED / "pool_7comp_gat_T.pt"      # GAT temperature scalar
-META_DIM       = 15  # shot_dist, shot_angle, is_header, is_open_play + technique×8 + gk_dist, n_def_in_cone, gk_off_centre
+MODEL_PATH          = PROCESSED / "pool_7comp_hybrid_xg.pt"
+TEMP_PATH           = PROCESSED / "pool_7comp_T.pt"              # GCN global temperature
+GAT_MODEL_PATH      = PROCESSED / "pool_7comp_hybrid_gat_xg.pt"
+GAT_TEMP_PATH       = PROCESSED / "pool_7comp_gat_T.pt"          # GAT global temperature
+PER_COMP_T_GCN_PATH = PROCESSED / "pool_7comp_per_comp_T_gcn.pt" # per-competition T (GCN)
+PER_COMP_T_GAT_PATH = PROCESSED / "pool_7comp_per_comp_T_gat.pt" # per-competition T (GAT)
+META_DIM            = 27  # full feature set (updated each sprint)
 SURPRISE_XG_THRESHOLD = 0.15   # goals below this are "worldies"
 
 # Technique index → display name
@@ -221,11 +223,17 @@ def compute_gat_attention(gat_model, graph) -> tuple[np.ndarray, np.ndarray] | N
                 float(graph.n_def_direct_line.item()) if hasattr(graph, "n_def_direct_line") else 0.0,
                 float(graph.is_right_foot.item()) if hasattr(graph, "is_right_foot") else 0.5,
             ]])                          # [1, 3]
-            meta = torch.cat([base, tech, gk, new], dim=1)  # [1, 18]
+            if actual_meta_dim >= 27:
+                plc = (graph.shot_placement.unsqueeze(0)
+                       if hasattr(graph, "shot_placement")
+                       else torch.zeros(1, 9))   # [1, 9]
+                meta = torch.cat([base, tech, gk, new, plc], dim=1)  # [1, 27]
+            else:
+                meta = torch.cat([base, tech, gk, new], dim=1)       # [1, 18]
         else:
-            meta = torch.cat([base, tech, gk], dim=1)       # [1, 15]
+            meta = torch.cat([base, tech, gk], dim=1)                # [1, 15]
     else:
-        meta = torch.cat([base, tech], dim=1)                # [1, 12]
+        meta = torch.cat([base, tech], dim=1)                         # [1, 12]
 
     with torch.no_grad():
         _, alphas = inner.forward_with_attention(x, ei, batch_v, meta)
@@ -306,13 +314,14 @@ def load_competition(key: str):
     return torch.load(path, weights_only=False)  # nosec: trusted internal data only
 
 
-def _build_meta(batch, meta_dim: int = 18) -> torch.Tensor:
+def _build_meta(batch, meta_dim: int = 27) -> torch.Tensor:
     """Build metadata tensor for a PyG batch.
 
-    Handles all historical meta_dim sizes:
+    Handles all historical meta_dim sizes gracefully:
       12 = base(4) + technique(8)
       15 = 12 + gk_original(3)
-      18 = 15 + gk_precision(3)   ← current target
+      18 = 15 + gk_precision(3)
+      27 = 18 + shot_placement(9)   ← current target (PSxG)
     Falls back gracefully when newer attributes are missing from old graphs.
     """
     n = batch.shot_dist.shape[0]
@@ -337,7 +346,6 @@ def _build_meta(batch, meta_dim: int = 18) -> torch.Tensor:
     if meta_dim < 18:
         return torch.cat([base, tech, gk], dim=1)   # [n, 15]
 
-    # New precision features — safe fallback for old graphs lacking the attrs
     def _safe(attr, default):
         if hasattr(batch, attr):
             return getattr(batch, attr).squeeze()
@@ -349,7 +357,16 @@ def _build_meta(batch, meta_dim: int = 18) -> torch.Tensor:
         _safe("is_right_foot",     0.5),   # unknown → neutral 0.5
     ], dim=1)                              # [n, 3]
 
-    return torch.cat([base, tech, gk, new], dim=1)   # [n, 18]
+    if meta_dim < 27:
+        return torch.cat([base, tech, gk, new], dim=1)   # [n, 18]
+
+    # PSxG placement: 9-dim one-hot goal-face zone (safe fallback for old graphs)
+    if hasattr(batch, "shot_placement"):
+        plc = batch.shot_placement.view(-1, 9)   # [n, 9]
+    else:
+        plc = torch.zeros(n, 9)                  # [n, 9] — unknown zone
+
+    return torch.cat([base, tech, gk, new, plc], dim=1)   # [n, 27]
 
 
 @st.cache_resource
@@ -959,19 +976,29 @@ with st.sidebar:
     _gat_sb, _gat_avail_sb = load_gat_model()
     _T_gat = _gat_sb.temperature if (_gat_avail_sb and isinstance(_gat_sb, TemperatureScaler)) else "—"
     st.markdown(
-        "**Model:** HybridGCN (GCN + dist/angle/header/technique)  \n"
-        "**Val AUC:** 0.790  ·  **Test AUC:** 0.751  \n"
-        "**vs StatsBomb xG:** 0.773  \n"
+        "**Model:** HybridGAT+T (GAT + metadata + placement)  \n"
+        "**Test AUC:** 0.763  ·  **Brier:** 0.159  \n"
+        "**vs StatsBomb xG:** 0.794 AUC  \n"
         "**Data:** 326 matches · 7 competitions"
     )
     st.markdown("---")
     _T_gat_str = f"{_T_gat:.3f}" if isinstance(_T_gat, float) else str(_T_gat)
     st.markdown(
-        f"🌡️ **Temperature scaling**  \n"
+        f"🌡️ **Temperature scaling (global)**  \n"
         f"GCN  T = `{_T_sb:.3f}`  \n"
-        f"GAT  T = `{_T_gat_str}`  \n"
-        f"*(T > 1 → squeezes over-confident probs)*"
+        f"GAT  T = `{_T_gat_str}`"
     )
+    # Per-competition T breakdown
+    _per_comp_T_gat = {}
+    if PER_COMP_T_GAT_PATH.exists():
+        try:
+            _per_comp_T_gat = torch.load(PER_COMP_T_GAT_PATH, weights_only=True)
+        except Exception:
+            pass
+    if _per_comp_T_gat:
+        with st.expander("Per-competition T (GAT)", expanded=False):
+            for _cl, _ct in sorted(_per_comp_T_gat.items()):
+                st.markdown(f"`{_cl}` → **{_ct:.3f}**")
 
 
 # ── Load data ─────────────────────────────────────────────────────────────────

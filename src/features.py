@@ -69,6 +69,69 @@ def encode_technique(technique: str) -> np.ndarray:
     return enc
 
 
+# StatsBomb shot_placement strings → goal-zone index (0 = unknown / wide / off-target)
+# Zones 1-8 map a 2×4 grid of the goal face (top/bottom × left/centre-left/centre-right/right)
+# plus special zones for the goalkeeper and post.
+#
+#   Zone layout (facing the goal):
+#     ┌───────┬────────┬────────┬───────┐
+#     │  3    │   4    │   4    │   5   │  ← top row
+#     │TL/HL  │  TC/H  │  TC/H  │ TR/HR │
+#     ├───────┼────────┼────────┼───────┤
+#     │  6    │   7    │   7    │   8   │  ← bottom row
+#     │BL/LL  │BC/LC/L │BC/LC/L │BR/LR/R│
+#     └───────┴────────┴────────┴───────┘
+#   Zone 1 = Goalkeeper / Saved (central keeper area)
+#   Zone 2 = Post / Bar
+#   Zone 0 = Unknown / Wide / Blocked / Missed / No Touch
+PLACEMENT_INDEX: dict[str, int] = {
+    # Zone 1 — goalkeeper / central save
+    "goalkeeper":           1,
+    "saved":                1,
+    "saved off target":     1,
+    "saved to post":        1,
+    # Zone 2 — post / bar
+    "post":                 2,
+    # Zone 3 — top left
+    "top left corner":      3,
+    "high left":            3,
+    # Zone 4 — top centre
+    "top centre":           4,
+    "high centre":          4,
+    "high":                 4,
+    # Zone 5 — top right
+    "top right corner":     5,
+    "high right":           5,
+    # Zone 6 — bottom left
+    "bottom left corner":   6,
+    "low left":             6,
+    "left":                 6,
+    # Zone 7 — bottom centre
+    "bottom centre":        7,
+    "low centre":           7,
+    "low":                  7,
+    # Zone 8 — bottom right
+    "bottom right corner":  8,
+    "low right":            8,
+    "right":                8,
+    # Zone 0 (default) — unknown, wide, blocked, missed, no touch
+}
+NUM_PLACEMENTS = 9  # 0 = unknown/wide, 1-8 = goal zones
+
+
+def encode_placement(placement: str) -> np.ndarray:
+    """One-hot encode a shot_placement string → (NUM_PLACEMENTS,) float32 array.
+
+    This is a post-shot feature (PSxG-style): it describes WHERE on the goal
+    face the ball ended up, enabling the model to distinguish top-corner strikes
+    from central saves. Zone 0 covers wide / off-target / unknown shots.
+    """
+    enc = np.zeros(NUM_PLACEMENTS, dtype=np.float32)
+    idx = PLACEMENT_INDEX.get((placement or "").lower().strip(), 0)
+    enc[idx] = 1.0
+    return enc
+
+
 # ---------------------------------------------------------------------------
 # Individual feature computations
 # ---------------------------------------------------------------------------

@@ -69,9 +69,10 @@ EPOCHS = 120
 BATCH  = 64
 LR     = 1e-3
 WD     = 1e-4
-META_DIM = 18  # shot_dist, shot_angle, is_header, is_open_play + technique×8
+META_DIM = 27  # shot_dist, shot_angle, is_header, is_open_play + technique×8
                # + gk_dist, n_def_in_cone, gk_off_centre          (original 3)
-               # + gk_perp_offset, n_def_direct_line, is_right_foot (new 3)
+               # + gk_perp_offset, n_def_direct_line, is_right_foot (precision 3)
+               # + shot_placement×9 (PSxG goal-face zone, one-hot)
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +290,7 @@ def _metadata_tensor(batch) -> torch.Tensor:
     [15]   gk_perp_offset     GK perpendicular distance (m) from shooter→goal line
     [16]   n_def_direct_line  defenders in ≤3° cone, directly in shot path
     [17]   is_right_foot      1=right foot, 0=left/header (weak-foot proxy)
+    [18:27] shot_placement    9-dim one-hot: goal-face zone (PSxG feature)
     """
     base = torch.stack([
         batch.shot_dist.squeeze(),
@@ -307,7 +309,8 @@ def _metadata_tensor(batch) -> torch.Tensor:
         batch.n_def_direct_line.squeeze(),
         batch.is_right_foot.squeeze(),
     ], dim=1)                              # [n, 3]
-    return torch.cat([base, tech, gk, new], dim=1).to(DEVICE)  # [n, 18]
+    plc  = batch.shot_placement.view(-1, 9)  # [n, 9] one-hot goal-face zone
+    return torch.cat([base, tech, gk, new, plc], dim=1).to(DEVICE)  # [n, 27]
 
 
 def train_epoch_hybrid(model, loader, optimizer, pos_weight):
@@ -317,7 +320,11 @@ def train_epoch_hybrid(model, loader, optimizer, pos_weight):
         batch = batch.to(DEVICE)
         meta  = _metadata_tensor(batch)
         optimizer.zero_grad()
-        logits = model(batch.x, batch.edge_index, batch.batch, meta)
+        # Pass edge_attr so HybridGATModel can use edge features in its attention layers.
+        # HybridXGModel (GCN) ignores the kwarg safely.
+        edge_attr = batch.edge_attr if batch.edge_attr is not None else None
+        logits = model(batch.x, batch.edge_index, batch.batch, meta,
+                       edge_attr=edge_attr)
         loss = F.binary_cross_entropy_with_logits(
             logits.squeeze(), batch.y.squeeze().float(), pos_weight=pos_weight
         )
@@ -334,13 +341,46 @@ def eval_hybrid(model, loader):
     for batch in loader:
         batch = batch.to(DEVICE)
         meta  = _metadata_tensor(batch)
-        logits_all.append(model(batch.x, batch.edge_index, batch.batch, meta).squeeze().cpu())
+        edge_attr = batch.edge_attr if batch.edge_attr is not None else None
+        logits_all.append(model(batch.x, batch.edge_index, batch.batch, meta,
+                                edge_attr=edge_attr).squeeze().cpu())
         y_all.append(batch.y.squeeze().cpu())
     logits = torch.cat(logits_all)
     y      = torch.cat(y_all).numpy().astype(int)
     probs  = torch.sigmoid(logits).numpy()
     auc    = roc_auc_score(y, probs) if len(np.unique(y)) > 1 else 0.5
     return auc, probs, y
+
+
+def _fit_per_comp_T(model, val_g: list, label: str) -> dict:
+    """Fit one temperature scaler per competition on the validation set.
+
+    Groups val graphs by their comp_label attribute, fits a separate T for each
+    group (skipping groups with fewer than 20 shots), and returns a dict mapping
+    comp_label → optimal T.
+
+    This reduces systematic bias between competitions — e.g. men's WC shots have
+    a different spatial distribution than women's WEURO, so a single global T
+    inevitably over- or under-calibrates one group.
+    """
+    from collections import defaultdict
+    groups: dict[str, list] = defaultdict(list)
+    for g in val_g:
+        cl = getattr(g, "comp_label", "") or "unknown"
+        groups[cl].append(g)
+
+    print(f"\n── Per-Competition T ({label}) ───────────────────────────────────")
+    per_comp_T: dict[str, float] = {}
+    for cl, graphs in sorted(groups.items()):
+        if len(graphs) < 20:
+            print(f"    {cl:25s}: skipped (n={len(graphs)} < 20)")
+            continue
+        loader = DataLoader(graphs, batch_size=BATCH)
+        s = TemperatureScaler(model, init_T=1.5)
+        s.fit(loader, device=str(DEVICE))
+        per_comp_T[cl] = s.temperature
+        print(f"    {cl:25s}: T={s.temperature:.4f}  (n={len(graphs)})")
+    return per_comp_T
 
 
 def train_hybrid(train_g, val_g, in_channels, pos_weight):
@@ -468,14 +508,22 @@ def run_experiment(name, train_g, val_g, test_g):
         torch.logit(torch.tensor(hybrid_gat_probs).clamp(1e-6, 1 - 1e-6)) / T_gat
     ).numpy()
 
-    # Save models + temperature scalars
+    # Save models + global temperature scalars
     out = PROCESSED_DIR
     torch.save(gcn.state_dict(),         out / f"{name}_gcn_xg.pt")
     torch.save(gat.state_dict(),         out / f"{name}_gat_xg.pt")
     torch.save(hybrid.state_dict(),      out / "pool_7comp_hybrid_xg.pt")       # canonical GCN path
     torch.save(hybrid_gat.state_dict(),  out / "pool_7comp_hybrid_gat_xg.pt")   # canonical GAT path
-    scaler.save(    out / "pool_7comp_T.pt")       # GCN temperature
-    scaler_gat.save(out / "pool_7comp_gat_T.pt")   # GAT temperature
+    scaler.save(    out / "pool_7comp_T.pt")       # GCN global temperature
+    scaler_gat.save(out / "pool_7comp_gat_T.pt")   # GAT global temperature
+
+    # Per-competition temperature (one T per competition label)
+    per_comp_T_gcn = _fit_per_comp_T(hybrid,     val_g, f"HybridGCN ({name})")
+    per_comp_T_gat = _fit_per_comp_T(hybrid_gat, val_g, f"HybridGAT ({name})")
+    torch.save(per_comp_T_gcn, out / "pool_7comp_per_comp_T_gcn.pt")
+    torch.save(per_comp_T_gat, out / "pool_7comp_per_comp_T_gat.pt")
+    print(f"  Per-comp T (GCN) → {out / 'pool_7comp_per_comp_T_gcn.pt'}")
+    print(f"  Per-comp T (GAT) → {out / 'pool_7comp_per_comp_T_gat.pt'}")
 
     # ── Benchmark table ───────────────────────────────────────────────────
     print(f"\n{'='*72}")

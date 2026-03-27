@@ -51,7 +51,7 @@ from src.graph_builder import (
     _compute_edge_features,
     PITCH_LENGTH, PITCH_WIDTH,
 )
-from src.features import enrich_graph, encode_technique
+from src.features import enrich_graph, encode_technique, encode_placement
 
 PROCESSED_DIR = REPO_ROOT / "data" / "processed"
 
@@ -209,7 +209,9 @@ def build_shot_graph(freeze_frame: list, label: float,
                      player_name: str = "",
                      team_name: str = "",
                      home_team: str = "",
-                     body_part: str = "") -> Data:
+                     body_part: str = "",
+                     placement: str = "",
+                     comp_label: str = "") -> Data:
     """Convert a StatsBomb 360 shot freeze frame into a PyG Data object."""
     positions, teams = [], []
     for p in freeze_frame:
@@ -240,6 +242,10 @@ def build_shot_graph(freeze_frame: list, label: float,
     # are harder — without needing explicit preferred-foot lookup.
     is_right_foot = 1.0 if "Right" in body_part else 0.0
 
+    # Post-shot placement zone (9-dim one-hot, PSxG feature):
+    # Encodes WHERE on the goal the ball ended up — top corner, saved centrally, etc.
+    placement_enc = encode_placement(placement)
+
     data = Data(
         x          = torch.tensor(x_feat,        dtype=torch.float),
         edge_index = torch.tensor(edge_index_np, dtype=torch.long),
@@ -261,12 +267,15 @@ def build_shot_graph(freeze_frame: list, label: float,
         gk_perp_offset    = torch.tensor([gk_feats["gk_perp_offset"]],    dtype=torch.float),
         n_def_direct_line = torch.tensor([gk_feats["n_def_direct_line"]], dtype=torch.float),
         is_right_foot     = torch.tensor([is_right_foot],                 dtype=torch.float),
+        # PSxG placement feature (META_DIM 18 → 27): 9-dim one-hot, goal-face zone
+        shot_placement    = torch.tensor(placement_enc,                   dtype=torch.float),
         # match-level context (for per-match report)
         match_id     = torch.tensor([match_id],  dtype=torch.long),
         minute       = torch.tensor([minute],    dtype=torch.long),
         player_name  = player_name,
         team_name    = team_name,
         home_team    = home_team,
+        comp_label   = comp_label,
     )
     return data
 
@@ -275,7 +284,8 @@ def build_shot_graph(freeze_frame: list, label: float,
 # Per-match processing
 # ---------------------------------------------------------------------------
 
-def process_match(match_id: int, home_team: str = "") -> tuple[list, dict]:
+def process_match(match_id: int, home_team: str = "",
+                  comp_label: str = "") -> tuple[list, dict]:
     stats = {"total_shots": 0, "with_frame": 0, "goals": 0, "no_goals": 0,
              "skipped_small": 0, "graphs": 0}
 
@@ -314,6 +324,7 @@ def process_match(match_id: int, home_team: str = "") -> tuple[list, dict]:
         is_header    = "Head" in body_part
         is_open_play = shot_type == "Open Play"
         technique    = str(row.get("shot_technique", "") or "")
+        placement    = str(row.get("shot_placement", "") or "")
         minute       = int(row.get("minute", 0) or 0)
         player_name  = str(row.get("player", "") or "")
         team_name    = str(row.get("team", "") or "")
@@ -327,7 +338,7 @@ def process_match(match_id: int, home_team: str = "") -> tuple[list, dict]:
                 ff, label, sb_xg, shot_loc, is_header, is_open_play,
                 technique=technique, match_id=match_id, minute=minute,
                 player_name=player_name, team_name=team_name, home_team=home_team,
-                body_part=body_part,
+                body_part=body_part, placement=placement, comp_label=comp_label,
             )
             graph = enrich_graph(graph, attacking_right=True, pressure_radius=5.0)
             dataset.append(graph)
@@ -365,7 +376,7 @@ def build_competition_shots(competition_ids: list[int], season_ids: list[int],
             away = str(row.get("away_team", "") or "")
             print(f"  [{i:2d}/{len(match_ids)}] {home} vs {away} ... ", end="", flush=True)
 
-            graphs, stats = process_match(mid, home_team=home)
+            graphs, stats = process_match(mid, home_team=home, comp_label=label)
             all_graphs.extend(graphs)
             for k in total:
                 total[k] += stats.get(k, 0)

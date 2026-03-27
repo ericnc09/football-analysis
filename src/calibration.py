@@ -209,12 +209,17 @@ class TemperatureScaler(nn.Module):
 
 def _default_meta(batch, device: str) -> torch.Tensor:
     """
-    Build the standard 18-dim metadata tensor for HybridXGModel.
+    Build the standard 27-dim metadata tensor for HybridXGModel / HybridGATModel.
     Mirrors _metadata_tensor() in train_xg_hybrid.py.
 
-    Layout: [shot_dist, shot_angle, is_header, is_open_play, technique×8,
-             gk_dist, n_def_in_cone, gk_off_centre,
-             gk_perp_offset, n_def_direct_line, is_right_foot]
+    Layout:
+      [0:4]   shot_dist, shot_angle, is_header, is_open_play
+      [4:12]  technique (8-dim one-hot)
+      [12:15] gk_dist, n_def_in_cone, gk_off_centre
+      [15:18] gk_perp_offset, n_def_direct_line, is_right_foot
+      [18:27] shot_placement (9-dim one-hot, PSxG goal-face zone)
+
+    Uses safe fallbacks so old 18-dim graphs still work with newer models.
     """
     n = batch.shot_dist.shape[0]
 
@@ -242,4 +247,10 @@ def _default_meta(batch, device: str) -> torch.Tensor:
         _safe("is_right_foot",     0.5),
     ], dim=1)                              # [n, 3]
 
-    return torch.cat([base, tech, gk, new], dim=1).to(device)  # [n, 18]
+    # PSxG placement: safe fallback → all-zeros (unknown zone) for old graphs
+    if hasattr(batch, "shot_placement"):
+        plc = batch.shot_placement.view(-1, 9)   # [n, 9]
+    else:
+        plc = torch.zeros(n, 9)                  # [n, 9] — zone 0 (unknown)
+
+    return torch.cat([base, tech, gk, new, plc], dim=1).to(device)  # [n, 27]

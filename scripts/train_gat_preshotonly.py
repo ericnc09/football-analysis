@@ -166,7 +166,7 @@ def fit_per_comp_T(model, val_g) -> dict[str, float]:
             continue
         loader = DataLoader(graphs, batch_size=BATCH)
         s = TemperatureScaler(model, init_T=1.5)
-        s.fit(loader, device="cpu")
+        s.fit(loader, device="cpu", meta_fn=meta18)  # must match training meta_fn
         per_T[cl] = s.temperature
         print(f"    {cl:25s}: T={s.temperature:.4f}  (n={len(graphs)})")
     return per_T
@@ -240,9 +240,9 @@ def main():
     torch.save(model.state_dict(), ckpt_path)
     print(f"\n  Saved → {ckpt_path.name}")
 
-    # 5. Global T
+    # 5. Global T — pass meta18 so TemperatureScaler uses 18-dim features
     scaler = TemperatureScaler(model, init_T=1.5)
-    scaler.fit(DataLoader(val_g, batch_size=BATCH), device="cpu")
+    scaler.fit(DataLoader(val_g, batch_size=BATCH), device="cpu", meta_fn=meta18)
     T_global = scaler.temperature
     torch.save({"T": torch.tensor(T_global)},
                PROCESSED / "pool_7comp_gat_no_plc_T.pt")

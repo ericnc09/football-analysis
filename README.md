@@ -347,8 +347,9 @@ A systematic review of Google Scholar (2018–2025) confirmed **no prior publish
 | A2 | ECE before/after temperature scaling, per-competition breakdown | `scripts/ablation_rq123.py` | ✅ Done |
 | A3 | GK precision feature ablation (drop `gk_perp_offset` + `n_def_direct_line`) | `scripts/ablation_rq123.py` | ✅ Done |
 | A4 | Metadata-only LR baseline: LR-4d, LR-12d, LR-27d variants | `scripts/lr_baseline.py` | ✅ Done |
+| A5 | RQ4 per-competition generalisation: 7-row table with gender, AUC CI, Brier, ECE, SB ref | `scripts/rq4_per_competition.py` | ✅ Done |
 
-Results: `data/processed/lr_baseline_results.json` · `data/processed/ablation_results.json` · `data/processed/ablation_table.txt`
+Results: `data/processed/lr_baseline_results.json` · `data/processed/ablation_results.json` · `data/processed/ablation_table.txt` · `data/processed/rq4_per_competition.json` · `data/processed/rq4_table.txt`
 
 ### Ablation Results — Table 1: RQ1 Three-Way Model Comparison
 
@@ -402,10 +403,41 @@ Zeroing `gk_perp_offset` (dim 15) + `n_def_direct_line` (dim 16):
 
 **Key RQ3 finding:** GK precision features add +0.010 AUC *exclusively* in the graph model — the linear model gains nothing from them. This confirms a **graph-exclusive interaction**: perpendicular GK offset and direct-line defenders require spatial freeze-frame context to be useful; a linear model cannot exploit their meaning without seeing the surrounding player configuration.
 
+### Ablation Results — Table 4: RQ4 Per-Competition Generalisation
+
+Model: HybridGAT+T (T=0.720) · single pooled model · no competition-specific retraining
+Test set: stratified 15% holdout · seed=42 · bootstrap n=2,000
+
+| Competition | Gender | n | Goal% | AUC | 95% CI | Brier (raw) | Brier (T) | ECE (raw) | ECE (T) | SB AUC | Δ vs SB |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| FIFA World Cup 2022 | Men's | 209 | 9.6% | 0.751 | [0.620–0.869] | 0.162 | 0.155 | 0.268 | 0.232 | 0.827 | −0.075 |
+| UEFA Euro 2020 | Men's | 175 | 11.4% | 0.763 | [0.637–0.876] | 0.161 | 0.153 | 0.249 | 0.218 | 0.827 | −0.065 |
+| UEFA Euro 2024 | Men's | 200 | 7.5% | 0.685 | [0.524–0.831] | 0.144 | 0.133 | 0.255 | 0.213 | 0.727 | −0.042 |
+| 1. Bundesliga 2023/24 | Men's | 130 | 14.6% | 0.748 | [0.617–0.866] | 0.158 | 0.152 | 0.226 | 0.186 | 0.845 | −0.097 |
+| FIFA Women's WC 2023 | Women's | 224 | 12.1% | 0.812 | [0.728–0.887] | 0.141 | 0.133 | 0.215 | 0.177 | 0.760 | **+0.051** |
+| UEFA Women's Euro 2022 | Women's | 124 | 7.3% | **0.844** | [0.697–0.977] | 0.152 | 0.146 | 0.293 | 0.265 | 0.862 | −0.017 |
+| UEFA Women's Euro 2025 | Women's | 141 | 11.3% | 0.715 | [0.575–0.843] | 0.181 | 0.179 | 0.277 | 0.248 | 0.729 | −0.014 |
+| **Men's (4 comps)** | — | 714 | 10.4% | 0.740 | [0.675–0.803] | 0.156 | 0.148 | 0.251 | 0.214 | 0.811 | −0.071 |
+| **Women's (3 comps)** | — | 489 | 10.6% | **0.785** | [0.725–0.844] | 0.155 | 0.149 | 0.252 | 0.218 | 0.768 | **+0.017** |
+| **All 7 comps** | — | 1,203 | 10.5% | 0.760 | [0.716–0.803] | 0.156 | 0.148 | 0.251 | 0.215 | 0.794 | −0.034 |
+
+**Key RQ4 findings:**
+- **Women's aggregate AUC 0.785 > Men's 0.740** — freeze-frame spatial patterns are more predictive in women's football without any competition-specific training; likely reflects lower defensive compactness allowing cleaner spatial geometry
+- **WWC2023: our model beats StatsBomb** (+0.051 AUC) — the single most striking cross-competition result; on women's open-play shots the freeze-frame graph captures real signal StatsBomb's features do not
+- **Euro 2024 hardest** (AUC 0.685, goal rate only 7.5%) — very low-scoring tournament with deep defensive blocks; shot quality is hardest to read from static freeze-frames alone
+- **T scaling improves ECE in all 7 competitions** — no single competition where calibration regresses
+- **AUC spread: 0.685 (Euro2024) → 0.844 (WEuro2022)** — 15.9 pp range; wide CIs on smaller test slices expected at n≈130
+
+Run the full RQ4 table:
+```bash
+python scripts/rq4_per_competition.py        # 7-row table + gender aggregates
+```
+
 Run all ablation experiments:
 ```bash
-python scripts/lr_baseline.py         # LR-4d / LR-12d / LR-27d baselines
-python scripts/ablation_rq123.py      # RQ1-3 three-way ablation with bootstrap CIs
+python scripts/lr_baseline.py                # LR-4d / LR-12d / LR-27d baselines
+python scripts/ablation_rq123.py             # RQ1-3 three-way ablation with bootstrap CIs
+python scripts/rq4_per_competition.py        # RQ4 per-competition generalisation
 ```
 
 ### Target Venues
@@ -474,6 +506,7 @@ python scripts/ablation_rq123.py      # RQ1-3 three-way ablation with bootstrap 
 - [x] **Bootstrap 95% CIs** — all paper tables populated; HybridGAT+T CI [0.716–0.803]
 - [x] **ECE per-competition table** — RQ2 complete; T scaling improves ECE in all 7 competitions
 - [x] **GK feature ablation** — RQ3 complete; +0.010 AUC graph-exclusive interaction confirmed
+- [x] **RQ4 per-competition table** — `python scripts/rq4_per_competition.py`; women's AUC 0.785 > men's 0.740; WWC2023 beats StatsBomb +0.051
 - [ ] **Deploy to HuggingFace Spaces** — `scripts/upload_to_hub.py`; add demo URL to paper
 
 **Sprint 3 (future):**

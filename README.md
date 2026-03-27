@@ -373,10 +373,10 @@ Test set: n=1,203 shots · 126 goals (10.5%) · 7 competitions · stratified spl
 | GCN-only *(graph spatial, no metadata)* | 0.655 | [0.607–0.700] | 0.232 | [0.226–0.238] | 0.369 | 0.166 |
 | HybridGAT *(graph+meta, no calibration)* | 0.760 | [0.716–0.803] | 0.156 | [0.146–0.165] | 0.251 | 0.344 |
 | **HybridGAT+T** *(graph+meta+calibration)* ★ | **0.760** | [0.716–0.803] | **0.148** | [0.137–0.159] | **0.215** | 0.344 |
-| *HybridGAT+T (18-dim, no shot_placement)* † | — | — | — | — | — | — |
+| *HybridGAT+T (18-dim, pre-shot only)* † | 0.761 | — | 0.149 | — | 0.215 | 0.347 |
 
 ★ **+0.011 AUC over LR-27d** · **95.7% of StatsBomb AUC** · Brier −0.039 vs LR-27d · ECE −0.078 vs LR-27d
-† Pre-shot-only row (no PSxG shot_placement feature) — results pending retraining run; will populate separately.
+† Pre-shot-only model trained **without** `shot_placement` (PSxG post-shot feature, dims [18:26]). AUC 0.761 vs 0.760 — virtually identical, confirming shot_placement adds negligible **ranking** power. Brier 0.149 vs 0.148 — marginal calibration benefit from the placement zone signal (ΔBrier = +0.001). The placement feature is worth disclosing but not load-bearing for the main AUC/Brier claims.
 
 **Paired bootstrap Brier CI (HybridGAT+T vs LR-27d):**
 ΔBrier = +0.0386 [+0.0337 – +0.0433] — **statistically significant at α=0.05** (CI excludes zero). HybridGAT+T is reliably better-calibrated than the metadata-only LR baseline.

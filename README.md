@@ -60,7 +60,8 @@ football-analysis/
 │   ├── match_report_screenshot.png # Match report tab screenshot
 │   ├── feature_importance.png      # Permutation importance bar chart (RQ5)
 │   ├── fig_graph_construction.png  # Fig 1: freeze-frame → graph pipeline (paper)
-│   └── fig_architecture.png        # Fig 2: HybridGATv2 block diagram (paper)
+│   ├── fig_architecture.png        # Fig 2: HybridGATv2 block diagram (paper)
+│   └── fig_reliability.png         # Fig 3: reliability diagram (calibration curve)
 │
 ├── scripts/
 │   ├── download_data.py            # Download Metrica CSV files from GitHub
@@ -364,22 +365,27 @@ Results: `data/processed/lr_baseline_results.json` · `data/processed/ablation_r
 
 Test set: n=1,203 shots · 126 goals (10.5%) · 7 competitions · stratified split seed=42 · bootstrap n=2,000
 
-| Model | AUC | 95% CI | Brier | ECE | AP |
-|---|---|---|---|---|---|
-| **StatsBomb xG** *(industry ref)* | **0.794** | [0.750–0.836] | **0.076** | **0.021** | **0.432** |
-| LR-12d *(basic metadata, no graph)* | 0.743 | [0.696–0.788] | 0.190 | 0.299 | 0.301 |
-| LR-27d *(full metadata, no graph)* | 0.749 | [0.704–0.792] | 0.187 | 0.293 | 0.320 |
-| GCN-only *(graph spatial, no metadata)* | 0.655 | [0.607–0.700] | 0.232 | 0.369 | 0.166 |
-| HybridGAT *(graph+meta, no calibration)* | 0.760 | [0.716–0.803] | 0.156 | 0.251 | 0.344 |
-| **HybridGAT+T** *(graph+meta+calibration)* ★ | **0.760** | [0.716–0.803] | **0.148** | **0.215** | 0.344 |
+| Model | AUC | AUC 95% CI | Brier | Brier 95% CI | ECE | AP |
+|---|---|---|---|---|---|---|
+| **StatsBomb xG** *(industry ref)* | **0.794** | [0.750–0.836] | **0.076** | [0.064–0.088] | **0.021** | **0.432** |
+| LR-12d *(basic metadata, no graph)* | 0.743 | [0.696–0.788] | 0.190 | [0.181–0.200] | 0.299 | 0.301 |
+| LR-27d *(full metadata, no graph)* | 0.749 | [0.704–0.792] | 0.187 | [0.177–0.197] | 0.293 | 0.320 |
+| GCN-only *(graph spatial, no metadata)* | 0.655 | [0.607–0.700] | 0.232 | [0.226–0.238] | 0.369 | 0.166 |
+| HybridGAT *(graph+meta, no calibration)* | 0.760 | [0.716–0.803] | 0.156 | [0.146–0.165] | 0.251 | 0.344 |
+| **HybridGAT+T** *(graph+meta+calibration)* ★ | **0.760** | [0.716–0.803] | **0.148** | [0.137–0.159] | **0.215** | 0.344 |
+| *HybridGAT+T (18-dim, no shot_placement)* † | — | — | — | — | — | — |
 
 ★ **+0.011 AUC over LR-27d** · **95.7% of StatsBomb AUC** · Brier −0.039 vs LR-27d · ECE −0.078 vs LR-27d
+† Pre-shot-only row (no PSxG shot_placement feature) — results pending retraining run; will populate separately.
+
+**Paired bootstrap Brier CI (HybridGAT+T vs LR-27d):**
+ΔBrier = +0.0386 [+0.0337 – +0.0433] — **statistically significant at α=0.05** (CI excludes zero). HybridGAT+T is reliably better-calibrated than the metadata-only LR baseline.
 
 **Key RQ1 findings:**
 - GCN-only *underperforms* LR-27d by −0.094 AUC: the spatial graph alone cannot compensate for metadata
 - HybridGAT+T *beats* LR-27d by +0.011 AUC: freeze-frame spatial context adds signal **only when combined** with metadata
-- 95% CIs overlap between models — the +0.011 gain is practically meaningful but modest, consistent with the open-data constraint
-- The graph-exclusive contribution is most visible in Brier (−0.039) and ECE (−0.078), not just ranking AUC
+- AUC 95% CIs overlap between models — the +0.011 gain is practically meaningful but modest, consistent with the open-data constraint
+- The graph-exclusive contribution is most visible in Brier (−0.039 vs LR-27d, significant) and ECE (−0.078), not just ranking AUC
 
 ### Ablation Results — Table 2: RQ2 Per-Competition Calibration (T = 0.720)
 
@@ -455,6 +461,7 @@ python scripts/rq4_per_competition.py        # RQ4 per-competition generalisatio
 |---|---|---|
 | Graph construction pipeline: freeze-frame → Delaunay → annotated node | `assets/fig_graph_construction.png` | Section 3 (Method) |
 | HybridGATv2 architecture block diagram: two-branch design → concat → head | `assets/fig_architecture.png` | Section 3 (Method) |
+| Reliability diagram: raw vs T-scaled vs StatsBomb calibration curves | `assets/fig_reliability.png` | Section 4 (Results, RQ2) |
 | Permutation feature importance bar chart | `assets/feature_importance.png` | Section 4 (Results, RQ5) |
 
 Generate figures:

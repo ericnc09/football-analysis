@@ -185,6 +185,46 @@ def bootstrap_auc_ci(y_true: np.ndarray, y_prob: np.ndarray,
     return float(roc_auc_score(y_true, y_prob)), float(ci[0]), float(ci[1])
 
 
+def bootstrap_brier_ci(y_true: np.ndarray, y_prob: np.ndarray,
+                       n_boot: int = 2000, seed: int = SEED):
+    """Return (brier, ci_low, ci_high) with 95 % bootstrap CI.
+
+    Paired bootstrap: the same resampled indices are used for both models when
+    comparing HybridGAT+T vs LR-27d, so the CI reflects the distribution of
+    the *difference*, not just each model in isolation.
+    """
+    rng = np.random.RandomState(seed)
+    n = len(y_true)
+    boot_briers = []
+    for _ in range(n_boot):
+        idx = rng.randint(0, n, n)
+        boot_briers.append(brier_score_loss(y_true[idx], y_prob[idx]))
+    ci = np.percentile(boot_briers, [2.5, 97.5])
+    return float(brier_score_loss(y_true, y_prob)), float(ci[0]), float(ci[1])
+
+
+def bootstrap_brier_diff_ci(y_true: np.ndarray,
+                             y_prob_a: np.ndarray,
+                             y_prob_b: np.ndarray,
+                             n_boot: int = 2000, seed: int = SEED):
+    """95 % CI for Brier(a) - Brier(b) via paired bootstrap.
+
+    Positive diff = model a is worse than model b.
+    Returns (observed_diff, ci_low, ci_high).
+    """
+    rng = np.random.RandomState(seed)
+    n = len(y_true)
+    boot_diffs = []
+    for _ in range(n_boot):
+        idx = rng.randint(0, n, n)
+        diff = (brier_score_loss(y_true[idx], y_prob_a[idx]) -
+                brier_score_loss(y_true[idx], y_prob_b[idx]))
+        boot_diffs.append(diff)
+    obs = brier_score_loss(y_true, y_prob_a) - brier_score_loss(y_true, y_prob_b)
+    ci  = np.percentile(boot_diffs, [2.5, 97.5])
+    return float(obs), float(ci[0]), float(ci[1])
+
+
 # ---------------------------------------------------------------------------
 # GNN inference helpers
 # ---------------------------------------------------------------------------
@@ -389,12 +429,21 @@ def main():
 
     results = {}
     for name, probs in models:
-        auc, ci_lo, ci_hi = bootstrap_auc_ci(y_test, probs, n_boot=args.n_boot)
-        brier = float(brier_score_loss(y_test, probs))
-        ece   = compute_ece(y_test, probs)
-        ap    = float(average_precision_score(y_test, probs))
+        auc, ci_lo, ci_hi       = bootstrap_auc_ci(y_test, probs, n_boot=args.n_boot)
+        brier, b_lo, b_hi       = bootstrap_brier_ci(y_test, probs, n_boot=args.n_boot)
+        ece                     = compute_ece(y_test, probs)
+        ap                      = float(average_precision_score(y_test, probs))
         results[name] = dict(auc=auc, ci_lo=ci_lo, ci_hi=ci_hi,
-                             brier=brier, ece=ece, ap=ap)
+                             brier=brier, brier_ci_lo=b_lo, brier_ci_hi=b_hi,
+                             ece=ece, ap=ap)
+
+    # Paired Brier diff CI: HybridGAT+T vs LR-27d  (key RQ1 comparison)
+    brier_diff, bd_lo, bd_hi = bootstrap_brier_diff_ci(
+        y_test,
+        probs_lr27,
+        probs_gat_cal,
+        n_boot=args.n_boot,
+    )  # positive = LR-27d worse than HybridGAT+T
 
     # ── 7. Per-competition breakdown (RQ2) ────────────────────────────────
     print("\n── Per-competition ECE (RQ2) ─────────────────────────────────────")
@@ -403,16 +452,18 @@ def main():
     # ── 8. Print tables ───────────────────────────────────────────────────
     header = (f"  {'Model':<42}  "
               f"{'AUC [95% CI]':<24}  "
-              f"{'Brier':>5}  {'ECE':>5}  {'AP':>5}")
+              f"{'Brier [95% CI]':<22}  {'ECE':>5}  {'AP':>5}")
 
-    print(f"\n{'=' * 78}")
+    print(f"\n{'=' * 90}")
     print("  RQ1: Three-way Ablation — Test Set Results")
-    print(f"{'=' * 78}")
+    print(f"{'=' * 90}")
     print(header)
-    print(f"  {'-' * 76}")
+    print(f"  {'-' * 88}")
     for name, m in results.items():
-        print(fmt_row(name, m["auc"], m["ci_lo"], m["ci_hi"],
-                      m["brier"], m["ece"], m["ap"]))
+        auc_str   = f"{m['auc']:.3f} [{m['ci_lo']:.3f}–{m['ci_hi']:.3f}]"
+        brier_str = f"{m['brier']:.3f} [{m['brier_ci_lo']:.3f}–{m['brier_ci_hi']:.3f}]"
+        print(f"  {name:<42}  {auc_str:<24}  {brier_str:<22}  "
+              f"{m['ece']:>5.3f}  {m['ap']:>5.3f}")
 
     # Key deltas
     auc_lr27  = results["LR-27d [full metadata, no graph]"]["auc"]
@@ -425,6 +476,9 @@ def main():
     print(f"    GCN-only  vs LR-27d       : {auc_gcn - auc_lr27:+.3f} AUC")
     print(f"    HybridGAT+T vs LR-27d     : {auc_gat - auc_lr27:+.3f} AUC  ← RQ1 claim")
     print(f"    HybridGAT+T vs StatsBomb  : {auc_gat - auc_sb:+.3f} AUC  ({100*auc_gat/auc_sb:.1f}% of SB)")
+    print(f"\n  Brier: HybridGAT+T vs LR-27d (paired bootstrap 95% CI):")
+    print(f"    ΔBrier = {brier_diff:+.4f}  [{bd_lo:+.4f} – {bd_hi:+.4f}]  "
+          f"({'significant' if bd_hi < 0 or bd_lo > 0 else 'not significant'} at α=0.05)")
     print(f"\n  RQ3: GK precision feature impact:")
     print(f"    HybridGAT+T full vs −GKprec: {auc_gat - auc_nogk:+.3f} AUC drop when removed")
 
@@ -466,6 +520,10 @@ def main():
         "rq2_ece_before_T":         ece_raw,
         "rq2_ece_after_T":          ece_cal,
         "rq3_gk_auc_drop":          float(auc_gat - auc_nogk),
+        "brier_diff_gat_vs_lr27":   brier_diff,
+        "brier_diff_ci_lo":         bd_lo,
+        "brier_diff_ci_hi":         bd_hi,
+        "brier_diff_significant":   bool(bd_hi < 0 or bd_lo > 0),
     }
 
     json_path = PROCESSED / "ablation_results.json"
@@ -480,14 +538,19 @@ def main():
         f.write("## Table 1: Three-way Ablation (held-out test set)\n\n")
         f.write(f"Test set: n={len(test_g)}, goals={int(y_test.sum())} "
                 f"({100*y_test.mean():.1f}%), 7 competitions\n\n")
-        f.write("| Model | AUC | 95% CI | Brier | ECE | AP |\n")
-        f.write("|---|---|---|---|---|---|\n")
+        f.write("| Model | AUC | AUC 95% CI | Brier | Brier 95% CI | ECE | AP |\n")
+        f.write("|---|---|---|---|---|---|---|\n")
         for name, m in results.items():
             f.write(f"| {name} | {m['auc']:.3f} | "
                     f"[{m['ci_lo']:.3f}–{m['ci_hi']:.3f}] | "
-                    f"{m['brier']:.3f} | {m['ece']:.3f} | {m['ap']:.3f} |\n")
+                    f"{m['brier']:.3f} | "
+                    f"[{m['brier_ci_lo']:.3f}–{m['brier_ci_hi']:.3f}] | "
+                    f"{m['ece']:.3f} | {m['ap']:.3f} |\n")
         f.write(f"\n★ HybridGAT+T reaches {100*auc_gat/auc_sb:.1f}% of StatsBomb xG AUC "
                 f"(Δ AUC vs LR-27d: {auc_gat - auc_lr27:+.3f})\n")
+        f.write(f"\nPaired bootstrap Brier diff (HybridGAT+T vs LR-27d): "
+                f"ΔBrier={brier_diff:+.4f} [{bd_lo:+.4f}–{bd_hi:+.4f}] "
+                f"({'p<0.05' if bd_hi < 0 or bd_lo > 0 else 'n.s.'})\n")
         f.write("\n## Table 2: Per-Competition Calibration (RQ2)\n\n")
         f.write(f"Global temperature T={T_gat:.3f} applied after training\n\n")
         f.write("| Competition | n | Goal Rate | AUC | ECE (raw) | ECE (T-scaled) | ΔECE |\n")

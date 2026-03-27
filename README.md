@@ -343,17 +343,70 @@ A systematic review of Google Scholar (2018–2025) confirmed **no prior publish
 
 | # | Experiment | Script | Status |
 |---|---|---|---|
-| A1 | Three-way ablation: LR-meta-27d vs GCN-only vs HybridGAT+T with bootstrap 95% CIs | `scripts/ablation_rq123.py` | ⬜ Pending |
-| A2 | ECE before/after temperature scaling, per-competition breakdown | `scripts/ablation_rq123.py` | ⬜ Pending |
-| A3 | GK precision feature ablation (drop `gk_perp_offset` + `n_def_direct_line`) | `scripts/ablation_rq123.py` | ⬜ Pending |
-| A4 | Metadata-only LR baseline: LR-4d, LR-12d, LR-27d variants | `scripts/lr_baseline.py` | ⬜ Pending |
+| A1 | Three-way ablation: LR-meta-27d vs GCN-only vs HybridGAT+T with bootstrap 95% CIs | `scripts/ablation_rq123.py` | ✅ Done |
+| A2 | ECE before/after temperature scaling, per-competition breakdown | `scripts/ablation_rq123.py` | ✅ Done |
+| A3 | GK precision feature ablation (drop `gk_perp_offset` + `n_def_direct_line`) | `scripts/ablation_rq123.py` | ✅ Done |
+| A4 | Metadata-only LR baseline: LR-4d, LR-12d, LR-27d variants | `scripts/lr_baseline.py` | ✅ Done |
 
-Run all four in one step:
+Results: `data/processed/lr_baseline_results.json` · `data/processed/ablation_results.json` · `data/processed/ablation_table.txt`
+
+### Ablation Results — Table 1: RQ1 Three-Way Model Comparison
+
+Test set: n=1,203 shots · 126 goals (10.5%) · 7 competitions · stratified split seed=42 · bootstrap n=2,000
+
+| Model | AUC | 95% CI | Brier | ECE | AP |
+|---|---|---|---|---|---|
+| **StatsBomb xG** *(industry ref)* | **0.794** | [0.750–0.836] | **0.076** | **0.021** | **0.432** |
+| LR-12d *(basic metadata, no graph)* | 0.743 | [0.696–0.788] | 0.190 | 0.299 | 0.301 |
+| LR-27d *(full metadata, no graph)* | 0.749 | [0.704–0.792] | 0.187 | 0.293 | 0.320 |
+| GCN-only *(graph spatial, no metadata)* | 0.655 | [0.607–0.700] | 0.232 | 0.369 | 0.166 |
+| HybridGAT *(graph+meta, no calibration)* | 0.760 | [0.716–0.803] | 0.156 | 0.251 | 0.344 |
+| **HybridGAT+T** *(graph+meta+calibration)* ★ | **0.760** | [0.716–0.803] | **0.148** | **0.215** | 0.344 |
+
+★ **+0.011 AUC over LR-27d** · **95.7% of StatsBomb AUC** · Brier −0.039 vs LR-27d · ECE −0.078 vs LR-27d
+
+**Key RQ1 findings:**
+- GCN-only *underperforms* LR-27d by −0.094 AUC: the spatial graph alone cannot compensate for metadata
+- HybridGAT+T *beats* LR-27d by +0.011 AUC: freeze-frame spatial context adds signal **only when combined** with metadata
+- 95% CIs overlap between models — the +0.011 gain is practically meaningful but modest, consistent with the open-data constraint
+- The graph-exclusive contribution is most visible in Brier (−0.039) and ECE (−0.078), not just ranking AUC
+
+### Ablation Results — Table 2: RQ2 Per-Competition Calibration (T = 0.720)
+
+| Competition | n | Goal Rate | AUC | ECE (raw) | ECE (T-scaled) | ΔECE |
+|---|---|---|---|---|---|---|
+| bundesliga2324 | 130 | 0.146 | 0.748 | 0.2261 | 0.1863 | −0.040 |
+| euro2020 | 175 | 0.114 | 0.763 | 0.2489 | 0.2178 | −0.031 |
+| euro2024 | 200 | 0.075 | 0.685 | 0.2553 | 0.2126 | −0.043 |
+| wc2022 | 209 | 0.096 | 0.751 | 0.2683 | 0.2320 | −0.036 |
+| weuro2022 | 124 | 0.073 | **0.844** | 0.2926 | 0.2654 | −0.027 |
+| weuro2025 | 141 | 0.113 | 0.715 | 0.2772 | 0.2479 | −0.029 |
+| wwc2023 | 224 | 0.121 | **0.812** | 0.2145 | 0.1771 | −0.037 |
+
+**Key RQ2 findings:**
+- Temperature scaling improves ECE in **every single competition** (ΔECE consistently negative, −0.027 to −0.043)
+- Global ECE: 0.251 → 0.215 (−14%) after T scaling; Brier: 0.156 → 0.148 (−5%)
+- Women's competitions lead on AUC (weuro2022: 0.844, wwc2023: 0.812) — freeze-frame spatial patterns are more predictive in women's football, likely due to lower defensive compactness allowing cleaner geometry
+- euro2024 hardest to predict (AUC 0.685, lowest goal rate 7.5%) — dense defending makes shot quality harder to read from freeze-frames alone
+
+### Ablation Results — Table 3: RQ3 GK Precision Feature Ablation
+
+Zeroing `gk_perp_offset` (dim 15) + `n_def_direct_line` (dim 16):
+
+| Model | AUC | ΔAUC vs full |
+|---|---|---|
+| HybridGAT+T *(full)* | 0.760 | — |
+| HybridGAT+T −GK precision | 0.750 | **−0.010** |
+| LR-27d *(full)* | 0.749 | — |
+| LR-27d −GK precision | 0.749 | ≈ 0.000 |
+
+**Key RQ3 finding:** GK precision features add +0.010 AUC *exclusively* in the graph model — the linear model gains nothing from them. This confirms a **graph-exclusive interaction**: perpendicular GK offset and direct-line defenders require spatial freeze-frame context to be useful; a linear model cannot exploit their meaning without seeing the surrounding player configuration.
+
+Run all ablation experiments:
 ```bash
-python scripts/lr_baseline.py         # LR variants + delta thresholds
-python scripts/ablation_rq123.py      # RQ1-3 full ablation with bootstrap CIs
+python scripts/lr_baseline.py         # LR-4d / LR-12d / LR-27d baselines
+python scripts/ablation_rq123.py      # RQ1-3 three-way ablation with bootstrap CIs
 ```
-Results saved to `data/processed/lr_baseline_results.json` and `data/processed/ablation_results.json`.
 
 ### Target Venues
 
@@ -416,11 +469,11 @@ Results saved to `data/processed/lr_baseline_results.json` and `data/processed/a
 - [x] **Ablation scripts written** — `lr_baseline.py` (LR variants) + `ablation_rq123.py` (RQ1-3 + bootstrap CIs)
 
 **Pre-submission (ablations):**
-- [ ] **Run LR baseline** — `python scripts/lr_baseline.py` → `lr_baseline_results.json`
-- [ ] **Run RQ1-3 ablation** — `python scripts/ablation_rq123.py` → `ablation_results.json` + `ablation_table.txt`
-- [ ] **Add bootstrap CIs to all paper tables** — populated automatically by `ablation_rq123.py`
-- [ ] **ECE per-competition table** — RQ2; Women's World Cup vs La Liga contrast case
-- [ ] **GK feature ablation** — RQ3; `gk_perp_offset` + `n_def_direct_line` zero-out test
+- [x] **Run LR baseline** — `python scripts/lr_baseline.py` → `lr_baseline_results.json`
+- [x] **Run RQ1-3 ablation** — `python scripts/ablation_rq123.py` → `ablation_results.json` + `ablation_table.txt`
+- [x] **Bootstrap 95% CIs** — all paper tables populated; HybridGAT+T CI [0.716–0.803]
+- [x] **ECE per-competition table** — RQ2 complete; T scaling improves ECE in all 7 competitions
+- [x] **GK feature ablation** — RQ3 complete; +0.010 AUC graph-exclusive interaction confirmed
 - [ ] **Deploy to HuggingFace Spaces** — `scripts/upload_to_hub.py`; add demo URL to paper
 
 **Sprint 3 (future):**

@@ -960,7 +960,7 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    view = st.radio("View", ["📍 Shot Map", "🔬 Shot Inspector", "📊 xG Distributions", "📋 Match Report", "🌟 Surprise Goals", "👤 Player Profile"])
+    view = st.radio("View", ["📍 Shot Map", "🔬 Shot Inspector", "📊 xG Distributions", "📋 Match Report", "🌟 Surprise Goals", "👤 Player Profile", "🔍 Feature Importance"])
 
     st.markdown("---")
 
@@ -1864,3 +1864,97 @@ elif view == "👤 Player Profile":
                     mime="text/csv",
                     use_container_width=True,
                 )
+
+# ── Feature Importance ────────────────────────────────────────────────────────
+elif view == "🔍 Feature Importance":
+    st.markdown("## Feature Importance — HybridGAT Metadata")
+    st.markdown(
+        "Permutation importance: each feature group is randomly shuffled across all "
+        "validation shots and the AUC drop is measured. A larger drop = stronger influence "
+        "on the model's xG predictions."
+    )
+
+    fi_path = PROCESSED / "feature_importance.json"
+
+    if not fi_path.exists():
+        st.info(
+            "Feature importance has not been computed yet. Run:\n\n"
+            "```bash\npython scripts/feature_importance.py --n-reps 5\n```\n\n"
+            "This takes ~2 minutes and saves results to `data/processed/feature_importance.json`."
+        )
+    else:
+        import json as _json
+
+        with open(fi_path) as _f:
+            fi_data = _json.load(_f)
+
+        baseline  = fi_data["baseline_auc"]
+        auc_drops = fi_data["auc_drops"]
+        n_reps    = fi_data.get("n_reps", 1)
+
+        st.markdown(
+            f"**Model:** {fi_data.get('model','HybridGAT+T')}  ·  "
+            f"**Baseline AUC:** {baseline:.4f}  ·  "
+            f"**Permutations per feature:** {n_reps}"
+        )
+
+        LABELS = {
+            "shot_dist":         "Shot distance",
+            "shot_angle":        "Shot angle",
+            "is_header":         "Header flag",
+            "is_open_play":      "Open play flag",
+            "technique":         "Shot technique (one-hot)",
+            "gk_dist":           "GK distance",
+            "n_def_in_cone":     "Defenders in wide cone",
+            "gk_off_centre":     "GK off-centre",
+            "gk_perp_offset":    "GK perpendicular offset",
+            "n_def_direct_line": "Defenders on shot line",
+            "is_right_foot":     "Right foot flag",
+            "shot_placement":    "Shot placement zone (PSxG)",
+        }
+
+        sorted_items = sorted(auc_drops.items(), key=lambda x: x[1], reverse=True)
+        names_fi  = [LABELS.get(k, k) for k, _ in sorted_items]
+        drops_fi  = [v for _, v in sorted_items]
+
+        # Colour by impact tier
+        bar_colours = [
+            "#e05c5c" if d > 0.005 else
+            "#f5a623" if d > 0.001 else
+            "#6b9ec7"
+            for d in drops_fi
+        ]
+
+        fig_fi, ax_fi = plt.subplots(figsize=(9, 5), facecolor=DARK_BG)
+        ax_fi.set_facecolor(PANEL_BG)
+        bars_fi = ax_fi.barh(names_fi, drops_fi, color=bar_colours,
+                             edgecolor="none", height=0.55)
+        ax_fi.axvline(0, color="white", lw=0.8, alpha=0.4)
+        ax_fi.set_xlabel("AUC drop when feature group is permuted", color="white", fontsize=11)
+        ax_fi.tick_params(colors="white", labelsize=10)
+        ax_fi.spines[["top","right","left","bottom"]].set_color("#333")
+
+        for bar, d in zip(bars_fi, drops_fi):
+            ax_fi.text(
+                max(d + 0.0003, 0.0003),
+                bar.get_y() + bar.get_height() / 2,
+                f"{d:+.4f}", va="center", ha="left", color="white", fontsize=9
+            )
+
+        plt.tight_layout()
+        st.pyplot(fig_fi, use_container_width=True)
+        plt.close(fig_fi)
+
+        # Summary table
+        df_fi = pd.DataFrame({
+            "Feature Group": names_fi,
+            "AUC Drop": [f"{d:+.4f}" for d in drops_fi],
+            "Impact": ["High" if d > 0.005 else "Medium" if d > 0.001 else "Low"
+                       for d in drops_fi],
+        })
+        st.dataframe(df_fi, use_container_width=True, hide_index=True)
+
+        st.caption(
+            "Red bars = high impact (AUC drop > 0.005)  ·  "
+            "Orange = medium (0.001–0.005)  ·  Blue = low (< 0.001)"
+        )

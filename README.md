@@ -55,6 +55,13 @@ football-analysis/
 │   ├── 02_graph_construction/   # Events/tracking → graph objects
 │   └── 03_gnn_experiments/      # Model training & evaluation
 │
+├── assets/
+│   ├── dashboard_hero.png          # README hero screenshot
+│   ├── match_report_screenshot.png # Match report tab screenshot
+│   ├── feature_importance.png      # Permutation importance bar chart (RQ5)
+│   ├── fig_graph_construction.png  # Fig 1: freeze-frame → graph pipeline (paper)
+│   └── fig_architecture.png        # Fig 2: HybridGATv2 block diagram (paper)
+│
 ├── scripts/
 │   ├── download_data.py            # Download Metrica CSV files from GitHub
 │   ├── build_graphs.py             # Metrica tracking → PyG graph datasets
@@ -309,6 +316,8 @@ y  pass_completion (0=complete, 1=failed)  ← StatsBomb experiments
 
 **Takeaway:** Shot placement is the single biggest Brier driver — knowing where the ball ended up on goal (top corner vs central save) captures shot quality that spatial freeze-frame geometry alone cannot infer. Brier drops a further −0.011 (−7%) to 0.148. The GAT edge_attr fix ensures attention weights are computed using actual player-pair distances rather than structure-only signals. Per-competition T reveals that WC2022 (men's, more powerful shots) needs sharper calibration (T=0.72) while WWC2023 needs less (T=0.86).
 
+> **⚠️ Canonical Brier note:** Two Brier figures appear in this README — **0.159** (Experiment 9, 18-dim metadata, global T only) and **0.148** (Experiment 10, 27-dim metadata, shot placement + per-competition T). The submission figure is **0.148**. The 0.159 figure belongs to a prior checkpoint and is retained for reproducibility of the training trajectory. All ablation scripts (RQ1-4) use the Experiment 10 model exclusively.
+
 ---
 
 ---
@@ -439,6 +448,37 @@ python scripts/lr_baseline.py                # LR-4d / LR-12d / LR-27d baselines
 python scripts/ablation_rq123.py             # RQ1-3 three-way ablation with bootstrap CIs
 python scripts/rq4_per_competition.py        # RQ4 per-competition generalisation
 ```
+
+### Paper Figures
+
+| Figure | File | Section |
+|---|---|---|
+| Graph construction pipeline: freeze-frame → Delaunay → annotated node | `assets/fig_graph_construction.png` | Section 3 (Method) |
+| HybridGATv2 architecture block diagram: two-branch design → concat → head | `assets/fig_architecture.png` | Section 3 (Method) |
+| Permutation feature importance bar chart | `assets/feature_importance.png` | Section 4 (Results, RQ5) |
+
+Generate figures:
+```bash
+python scripts/generate_paper_figures.py
+```
+
+### Temperature Scaling — Per-Competition T Values
+
+T values fitted via LBFGS on NLL on the validation set after training. A single pooled model is trained; T is fitted separately per competition without any retraining.
+
+| Competition | Gender | Global T (GAT) | Per-comp T (GAT) | Per-comp T (GCN) | Interpretation |
+|---|---|---|---|---|---|
+| FIFA World Cup 2022 | Men's | 0.720 | 0.737 | 0.884 | Sharp calibration — low T = model was overconfident on WC shots |
+| UEFA Euro 2020 | Men's | 0.720 | 0.639 | 0.761 | Sharpest correction; Euro 2020 shot distribution most compressed |
+| UEFA Euro 2024 | Men's | 0.720 | 0.643 | 0.776 | Similar to Euro 2020; deep-block tournament |
+| 1. Bundesliga 2023/24 | Men's | 0.720 | 0.872 | 1.117 | Near-neutral; Bundesliga shots closest to training prior |
+| FIFA Women's WC 2023 | Women's | 0.720 | 0.864 | 1.044 | GCN T > 1 = model was under-confident on women's shots |
+| UEFA Women's Euro 2022 | Women's | 0.720 | 0.713 | 0.855 | Close to global T |
+| UEFA Women's Euro 2025 | Women's | 0.720 | 0.544 | 0.701 | Strongest correction of all competitions |
+
+**T < 1**: model was over-confident (predicted probabilities too high → divide by T < 1 sharpens/reduces them).
+**T > 1**: model was under-confident (predicted probabilities too flat → divide by T > 1 spreads them).
+**T spread (0.544–0.872 for GAT)** confirms that a single global T is a meaningful but incomplete calibrator — per-competition T is required for publication-level calibration claims.
 
 ### Target Venues
 

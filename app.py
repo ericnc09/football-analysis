@@ -8,11 +8,56 @@ Run:
     streamlit run app.py
 """
 
+import os
 import sys
 import html as _html
 import warnings
 warnings.filterwarnings("ignore")
 from pathlib import Path
+
+# ── HuggingFace Hub bootstrap (runs before anything else on cloud deployments) ─
+# On HuggingFace Spaces the data/processed/ directory doesn't exist.
+# We download model weights + shot graphs at startup from HF Hub.
+# Set HF_REPO_ID as a Space secret (or env var) to enable; no-op locally.
+_HF_REPO_ID = os.environ.get("HF_REPO_ID", "")
+if _HF_REPO_ID:
+    _PROCESSED = Path(__file__).parent / "data" / "processed"
+    _PROCESSED.mkdir(parents=True, exist_ok=True)
+    _NEEDED = [
+        # Model weights
+        "pool_7comp_hybrid_xg.pt",
+        "pool_7comp_hybrid_gat_xg.pt",
+        # Global temperature scalars
+        "pool_7comp_T.pt",
+        "pool_7comp_gat_T.pt",
+        # Per-competition temperature dicts
+        "pool_7comp_per_comp_T_gcn.pt",
+        "pool_7comp_per_comp_T_gat.pt",
+        # Shot graphs (one per competition)
+        "statsbomb_wc2022_shot_graphs.pt",
+        "statsbomb_wwc2023_shot_graphs.pt",
+        "statsbomb_euro2020_shot_graphs.pt",
+        "statsbomb_euro2024_shot_graphs.pt",
+        "statsbomb_bundesliga2324_shot_graphs.pt",
+        "statsbomb_weuro2022_shot_graphs.pt",
+        "statsbomb_weuro2025_shot_graphs.pt",
+    ]
+    try:
+        from huggingface_hub import hf_hub_download
+        _token = os.environ.get("HF_TOKEN")
+        for _fname in _NEEDED:
+            _dest = _PROCESSED / _fname
+            if not _dest.exists():
+                hf_hub_download(
+                    repo_id=_HF_REPO_ID,
+                    filename=_fname,
+                    local_dir=str(_PROCESSED),
+                    token=_token,
+                )
+    except Exception as _e:
+        import streamlit as st
+        st.error(f"Failed to download model data from HuggingFace Hub: {_e}")
+        st.stop()
 
 import numpy as np
 import torch

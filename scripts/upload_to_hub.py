@@ -34,15 +34,27 @@ from pathlib import Path
 REPO_ROOT   = Path(__file__).parent.parent
 PROCESSED   = REPO_ROOT / "data" / "processed"
 
-# Files to upload — model weights + calibration scalars
+# Files to upload — model weights, calibration scalars, and shot graphs
 UPLOAD_FILES = [
-    "pool_7comp_hybrid_xg.pt",          # HybridGCN weights
-    "pool_7comp_hybrid_gat_xg.pt",      # HybridGAT weights
-    "pool_7comp_T.pt",                  # GCN global temperature
-    "pool_7comp_gat_T.pt",              # GAT global temperature
-    "pool_7comp_per_comp_T_gcn.pt",     # GCN per-competition temperatures
-    "pool_7comp_per_comp_T_gat.pt",     # GAT per-competition temperatures
-    "feature_importance.json",          # Pre-computed feature importance (optional)
+    # Model weights
+    "pool_7comp_hybrid_xg.pt",
+    "pool_7comp_hybrid_gat_xg.pt",
+    # Global temperature scalars
+    "pool_7comp_T.pt",
+    "pool_7comp_gat_T.pt",
+    # Per-competition temperature dicts
+    "pool_7comp_per_comp_T_gcn.pt",
+    "pool_7comp_per_comp_T_gat.pt",
+    # Shot graphs — downloaded by app.py on HF Spaces at startup
+    "statsbomb_wc2022_shot_graphs.pt",
+    "statsbomb_wwc2023_shot_graphs.pt",
+    "statsbomb_euro2020_shot_graphs.pt",
+    "statsbomb_euro2024_shot_graphs.pt",
+    "statsbomb_bundesliga2324_shot_graphs.pt",
+    "statsbomb_weuro2022_shot_graphs.pt",
+    "statsbomb_weuro2025_shot_graphs.pt",
+    # Optional pre-computed artefacts
+    "feature_importance.json",
 ]
 
 

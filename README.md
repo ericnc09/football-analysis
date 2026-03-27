@@ -334,13 +334,14 @@ y  pass_completion (0=complete, 1=failed)  ← StatsBomb experiments
 - [x] **Shot placement feature** — `shot_placement` 9-bin PSxG one-hot; META_DIM 18 → 27; Brier 0.159 → 0.148
 - [x] **GAT edge features** — edge_attr (distance, Δx, Δy, team) now passed to GATv2Conv during training
 - [x] **Per-competition temperature** — one T per competition label; WC2022 T=0.72, WWC2023 T=0.86
-- [ ] **More data** — La Liga 2015/16, NWSL; target 12,000+ shots for better Brier convergence
-- [ ] **SHAP feature importance** — permutation importance on 27 metadata dims
-- [ ] **Residual/skip connections** — concatenate metadata directly into each GCN/GAT layer
+- [x] **Permutation feature importance** — 12 feature groups ranked by AUC drop; GK distance dominates (+0.223)
+- [x] **Feature Importance dashboard tab** — pre-computed bar chart + impact table in the app
+- [x] **Cloud deployment prep** — `Dockerfile` (python:3.11-slim + CPU torch), `requirements.txt`, `scripts/upload_to_hub.py`
+- [ ] **Residual metadata injection** — feed metadata into each GCN/GAT layer (not just the head)
 - [ ] **Node-level prediction** — predict pass destination (which player receives), not just outcome
 - [ ] **Temporal GNNs** — use sequence of 5 frames before a shot/pass to capture player momentum
 - [ ] **Formation classifier** — cluster position snapshots into tactical shapes (4-4-2, 4-3-3, etc.)
-- [ ] **Cloud deployment** — Railway + HuggingFace Hub for model files (Dockerfile ready)
+- [ ] **Deploy to Railway** — push Docker image + set HF_TOKEN, get public URL
 
 ---
 

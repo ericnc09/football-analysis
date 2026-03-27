@@ -4,7 +4,9 @@ Graph Neural Network (GNN) research applied to football (soccer). Players are mo
 
 ![Football GNN Dashboard — Shot Map · Freeze Frame · Gradient Saliency · xG Comparison](assets/dashboard_hero.png)
 
-> **HybridGAT+T achieves AUC 0.760 · Brier 0.148** on 8,013 shots across 7 StatsBomb 360 competitions — trained with 27-dim metadata including PSxG shot placement, GK positioning, defensive blocking, and foot preference. Per-competition temperature scaling applied. Reaches 96% of StatsBomb's proprietary xG AUC using only free, open data.
+> **HybridGAT+T achieves AUC 0.760 · Brier 0.148** on 8,013 shots across 7 StatsBomb 360 competitions — trained with 27-dim metadata including PSxG shot placement, GK positioning, defensive blocking, and foot preference. Per-competition temperature scaling applied. Reaches **95.7% of StatsBomb's proprietary xG AUC** using only free, open data.
+
+> 🎯 **Publication in progress** — targeting MIT Sloan Sports Analytics Conference. Five novel contributions confirmed against existing literature: GATv2 hybrid xG on freeze-frames, temperature scaling for xG, geometric GK features, cross-gender multi-competition evaluation, and permutation importance on GNN xG.
 
 ---
 
@@ -13,6 +15,12 @@ Graph Neural Network (GNN) research applied to football (soccer). Players are mo
 ![Match Report — Germany vs Japan · Shot maps · KPI table · Cumulative xG timeline](assets/match_report_screenshot.png)
 
 The **Match Report** tab delivers a full per-match breakdown: side-by-side home/away shot maps coloured by HybridGAT xG, a KPI table (shots, goals, model xG, StatsBomb xG), and a cumulative xG step-function timeline with goal markers — select any match from any of the 7 competitions in the sidebar.
+
+### 🔍 Feature Importance
+
+![Feature Importance — Permutation importance across 12 metadata groups; GK distance dominates](assets/feature_importance.png)
+
+The **Feature Importance** tab shows permutation importance across 12 feature groups: shuffling each group on the validation set and measuring AUC degradation. GK distance dominates (+0.223 AUC drop), followed by shot distance (+0.070) and header flag (+0.060). Pre-computed results load instantly with no re-inference needed.
 
 ### Dashboard tabs
 
@@ -24,6 +32,7 @@ The **Match Report** tab delivers a full per-match breakdown: side-by-side home/
 | 📋 **Match Report** | 4-panel report: home/away shot maps, KPI text, cumulative xG timeline; analyst narrative with executive summary and shot-by-shot log |
 | 🌟 **Surprise Goals** | Goals rated < 15% xG by the model — worldies, deflections, and individual brilliance; ranked pitch map + table with player/team/minute |
 | 👤 **Player Profile** | Per-player shots/goals/xG/overperformance aggregated across the competition; scatter of Goals vs xG; sortable/filterable table; CSV download |
+| 🔍 **Feature Importance** | Permutation importance bar chart across 12 metadata groups + ranked impact table; pre-computed from `feature_importance.json` |
 
 ## Goal
 
@@ -50,11 +59,15 @@ football-analysis/
 │   ├── download_data.py            # Download Metrica CSV files from GitHub
 │   ├── build_graphs.py             # Metrica tracking → PyG graph datasets
 │   ├── build_statsbomb_graphs.py   # StatsBomb 360 → pass-completion graphs
-│   ├── build_shot_graphs.py        # StatsBomb 360 → xG shot graphs
+│   ├── build_shot_graphs.py        # StatsBomb 360 → xG shot graphs (with shot_placement + comp_label)
 │   ├── train_team_classifier.py    # Experiment 1 & 2: which team is passing?
 │   ├── train_statsbomb_classifier.py  # Experiment 3 & 4: pass completion
 │   ├── train_xg_model.py           # Experiment 5 & 6: GCN/GAT xG vs baselines
-│   └── train_xg_hybrid.py          # Experiment 7 & 8: Hybrid xG (GCN + metadata)
+│   ├── train_xg_hybrid.py          # Experiment 7–10: HybridGAT+T, 27-dim meta, per-comp T
+│   ├── feature_importance.py       # Permutation importance across 12 metadata groups
+│   ├── lr_baseline.py              # Metadata-only LR baselines (4d / 12d / 27d)
+│   ├── ablation_rq123.py           # RQ1-3 ablation: LR vs GCN vs HybridGAT+T + bootstrap CIs
+│   └── upload_to_hub.py            # Upload model weights to HuggingFace Hub
 │
 ├── src/
 │   ├── graph_builder.py   # Core: events/tracking → PyG Data objects
@@ -298,6 +311,67 @@ y  pass_completion (0=complete, 1=failed)  ← StatsBomb experiments
 
 ---
 
+---
+
+## Research & Publication Plan
+
+### Novel Contributions vs Existing Literature
+
+A systematic review of Google Scholar (2018–2025) confirmed **no prior published paper** combines all of the following:
+
+| Contribution | Literature Gap |
+|---|---|
+| GATv2 + StatsBomb 360 freeze-frames for xG | Existing GNN xG work (Skor-xG) uses skeleton tracking, not freeze-frames; no open-data GATv2 xG paper exists |
+| Temperature scaling applied to any xG model | Calibration post-processing (Platt, isotonic) appears in sport prediction broadly but never on xG specifically |
+| Geometric GK features: `gk_perp_offset`, `n_def_direct_line` | Standard models use GK distance/angle only; perpendicular offset from shot line is novel |
+| 7-competition evaluation including cross-gender | Largest multi-competition open-data GNN xG evaluation; no cross-gender GNN xG study found |
+| Permutation importance on a GNN xG model | No published permutation importance analysis on any GNN xG model |
+
+### Research Questions
+
+**RQ1** — Does modelling the spatial freeze-frame graph with a GATv2 hybrid architecture provide a statistically significant improvement in xG estimation accuracy and calibration over metadata-only logistic regression baselines?
+
+**RQ2** — Does temperature scaling with per-competition calibration reduce systematic prediction bias across football competitions with structurally different playing styles, and is this effect consistent across men's and women's competitions?
+
+**RQ3** — Do geometrically-derived goalkeeper positioning features (`gk_perp_offset`, `n_def_direct_line`) add predictive signal beyond distance and angle alone, and does this signal interact with the graph component or appear in linear models too?
+
+**RQ4** — Can a GNN xG model trained on open-access StatsBomb 360 data generalise across competitions and gender without competition-specific retraining?
+
+**RQ5** — Which spatial contextual features from freeze-frame data contribute most to xG model performance: goalkeeper positioning, defensive pressure, or shot technique?
+
+### Ablation Experiments (Pre-Submission Checklist)
+
+| # | Experiment | Script | Status |
+|---|---|---|---|
+| A1 | Three-way ablation: LR-meta-27d vs GCN-only vs HybridGAT+T with bootstrap 95% CIs | `scripts/ablation_rq123.py` | ⬜ Pending |
+| A2 | ECE before/after temperature scaling, per-competition breakdown | `scripts/ablation_rq123.py` | ⬜ Pending |
+| A3 | GK precision feature ablation (drop `gk_perp_offset` + `n_def_direct_line`) | `scripts/ablation_rq123.py` | ⬜ Pending |
+| A4 | Metadata-only LR baseline: LR-4d, LR-12d, LR-27d variants | `scripts/lr_baseline.py` | ⬜ Pending |
+
+Run all four in one step:
+```bash
+python scripts/lr_baseline.py         # LR variants + delta thresholds
+python scripts/ablation_rq123.py      # RQ1-3 full ablation with bootstrap CIs
+```
+Results saved to `data/processed/lr_baseline_results.json` and `data/processed/ablation_results.json`.
+
+### Target Venues
+
+| Venue | Format | Deadline (approx) | Fit |
+|---|---|---|---|
+| **MIT Sloan Sports Analytics Conference** | 8-page research paper | Oct/Nov each year | ⭐ Primary — practitioner + ML audience, xG is well-understood |
+| **ECML/PKDD Sports Analytics Workshop** | 6–10 pages | May/Jun each year | ⭐ Secondary — ML-rigorous, ablation tables expected |
+| **StatsBomb Conference** | Presentation / short paper | Q1 each year | Good for early visibility; less peer-reviewed |
+| **Journal of Sports Sciences** | Full article | Rolling | Cross-gender generalisation angle (RQ4) |
+
+### Honest Limitations (to address in paper)
+
+- StatsBomb AUC = 0.794 vs ours 0.760 — the **open-data cost** (0.034 AUC gap). StatsBomb has tactical event sequences, 25Hz tracking, and proprietary feature engineering unavailable in the open dataset. Framed explicitly, not hidden.
+- Shot placement is a **PSxG feature** (post-shot information): it encodes where the ball ended up, not where it was aimed. It improves Brier but is not a pure pre-shot predictor. Disclosed and discussed in method.
+- 8,013 shots is large for open data but small for GNN training — model capacity is limited by data, not architecture.
+
+---
+
 ## Summary Table — All Experiments
 
 | # | Task | Train Data | Test n | Best Model | AUC | Notes |
@@ -337,11 +411,44 @@ y  pass_completion (0=complete, 1=failed)  ← StatsBomb experiments
 - [x] **Permutation feature importance** — 12 feature groups ranked by AUC drop; GK distance dominates (+0.223)
 - [x] **Feature Importance dashboard tab** — pre-computed bar chart + impact table in the app
 - [x] **Cloud deployment prep** — `Dockerfile` (python:3.11-slim + CPU torch), `requirements.txt`, `scripts/upload_to_hub.py`
+- [x] **Literature review** — confirmed 5 novel contributions vs published xG + GNN literature (2018–2025)
+- [x] **Research questions drafted** — RQ1–5 scoped to existing dataset and implementation
+- [x] **Ablation scripts written** — `lr_baseline.py` (LR variants) + `ablation_rq123.py` (RQ1-3 + bootstrap CIs)
+
+**Pre-submission (ablations):**
+- [ ] **Run LR baseline** — `python scripts/lr_baseline.py` → `lr_baseline_results.json`
+- [ ] **Run RQ1-3 ablation** — `python scripts/ablation_rq123.py` → `ablation_results.json` + `ablation_table.txt`
+- [ ] **Add bootstrap CIs to all paper tables** — populated automatically by `ablation_rq123.py`
+- [ ] **ECE per-competition table** — RQ2; Women's World Cup vs La Liga contrast case
+- [ ] **GK feature ablation** — RQ3; `gk_perp_offset` + `n_def_direct_line` zero-out test
+- [ ] **Deploy to HuggingFace Spaces** — `scripts/upload_to_hub.py`; add demo URL to paper
+
+**Sprint 3 (future):**
 - [ ] **Residual metadata injection** — feed metadata into each GCN/GAT layer (not just the head)
 - [ ] **Node-level prediction** — predict pass destination (which player receives), not just outcome
 - [ ] **Temporal GNNs** — use sequence of 5 frames before a shot/pass to capture player momentum
 - [ ] **Formation classifier** — cluster position snapshots into tactical shapes (4-4-2, 4-3-3, etc.)
-- [ ] **Deploy to Railway** — push Docker image + set HF_TOKEN, get public URL
+- [ ] **SkillCorner data partnership** — cold-email for academic access to expand dataset
+
+---
+
+## Deployment
+
+The app is packaged for **HuggingFace Spaces** (free, 16 GB RAM, no sleep). Model weights live on HuggingFace Hub and are downloaded at startup.
+
+```bash
+# 1. Upload model weights to HuggingFace Hub
+python scripts/upload_to_hub.py --repo your-username/football-xg --create
+
+# 2. Push app to HF Spaces (Streamlit SDK, requirements.txt build)
+#    Create a Space at huggingface.co/new-space → Streamlit → push this repo
+
+# 3. Or run locally with Docker
+docker build -t football-xg .
+docker run -p 8501:8501 -e HF_TOKEN=your_token football-xg
+```
+
+The `Dockerfile` uses `python:3.11-slim` with CPU-only PyTorch and PyG wheels (~3 GB image). No GPU required.
 
 ---
 

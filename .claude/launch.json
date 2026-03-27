@@ -2,22 +2,10 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "Football GNN Dashboard",
+      "name": "football-dashboard",
       "runtimeExecutable": "/Users/eric/projects/football-analysis/.venv/bin/streamlit",
-      "runtimeArgs": ["run", "app.py", "--server.port", "8501", "--server.headless", "true"],
+      "runtimeArgs": ["run", "app.py", "--server.port=8501", "--server.headless=true"],
       "port": 8501
-    },
-    {
-      "name": "Jupyter Notebook",
-      "runtimeExecutable": "/Library/Frameworks/Python.framework/Versions/3.10/bin/jupyter",
-      "runtimeArgs": ["notebook", "--notebook-dir=notebooks", "--no-browser", "--port=8888"],
-      "port": 8888
-    },
-    {
-      "name": "Jupyter Notebook (repo root)",
-      "runtimeExecutable": "/Library/Frameworks/Python.framework/Versions/3.10/bin/jupyter",
-      "runtimeArgs": ["notebook", "--no-browser", "--port=8889"],
-      "port": 8889
     }
   ]
 }

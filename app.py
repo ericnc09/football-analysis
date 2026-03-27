@@ -113,7 +113,7 @@ class HybridXGModel(nn.Module):
             x = F.dropout(F.relu(conv(x, edge_index)), p=self.dropout, training=self.training)
         return global_mean_pool(x, batch)
 
-    def forward(self, x, edge_index, batch, metadata):
+    def forward(self, x, edge_index, batch, metadata, edge_attr=None):
         return self.head(torch.cat([self.encode(x, edge_index, batch), metadata], dim=1))
 
 

@@ -112,7 +112,7 @@ class HybridXGModel(nn.Module):
                           p=self.dropout, training=self.training)
         return global_mean_pool(x, batch)          # [n_graphs, hidden_dim]
 
-    def forward(self, x, edge_index, batch, metadata):
+    def forward(self, x, edge_index, batch, metadata, edge_attr=None):
         emb = self.encode(x, edge_index, batch)    # [n_graphs, hidden_dim]
         combined = torch.cat([emb, metadata], dim=1)
         return self.head(combined)                 # [n_graphs, 1]

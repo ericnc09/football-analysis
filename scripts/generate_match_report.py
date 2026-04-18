@@ -61,29 +61,11 @@ PL, PW = 105.0, 68.0
 GOAL_X, GOAL_Y = PL, PW / 2
 
 
-# ── Model (mirrors app.py) ────────────────────────────────────────────────────
-
-class HybridXGModel(nn.Module):
-    def __init__(self, in_channels=9, hidden_dim=64, meta_dim=META_DIM, dropout=0.3):
-        super().__init__()
-        self.convs = nn.ModuleList([
-            GCNConv(in_channels, hidden_dim),
-            GCNConv(hidden_dim,  hidden_dim),
-            GCNConv(hidden_dim,  hidden_dim),
-        ])
-        self.dropout = dropout
-        self.head = nn.Sequential(
-            nn.Linear(hidden_dim + meta_dim, hidden_dim),
-            nn.ReLU(), nn.Dropout(dropout), nn.Linear(hidden_dim, 1),
-        )
-
-    def encode(self, x, edge_index, batch):
-        for conv in self.convs:
-            x = F.dropout(F.relu(conv(x, edge_index)), p=self.dropout, training=self.training)
-        return global_mean_pool(x, batch)
-
-    def forward(self, x, edge_index, batch, metadata):
-        return self.head(torch.cat([self.encode(x, edge_index, batch), metadata], dim=1))
+# ── Model ─────────────────────────────────────────────────────────────────────
+# Canonical HybridXGModel lives in src/models/hybrid_gcn.py — imported here
+# so the match-report script can never drift against app.py or the training
+# script.
+from src.models.hybrid_gcn import HybridXGModel  # noqa: E402
 
 
 def _build_meta_single(g, meta_dim):

@@ -34,11 +34,17 @@ from pathlib import Path
 REPO_ROOT   = Path(__file__).parent.parent
 PROCESSED   = REPO_ROOT / "data" / "processed"
 
-# Files to upload — model weights, calibration scalars, and shot graphs
+# Files to upload — model weights, calibration scalars, and shot graphs.
+#
+# **Every model .pt MUST be accompanied by its .meta.json sidecar** (see
+# src/model_metadata.py). Uploading one without the other leaves the serving
+# layer with no feature-schema contract and `app.py` will refuse to load.
 UPLOAD_FILES = [
-    # Model weights
+    # Model weights (paired with sidecars below)
     "pool_7comp_hybrid_xg.pt",
+    "pool_7comp_hybrid_xg.meta.json",
     "pool_7comp_hybrid_gat_xg.pt",
+    "pool_7comp_hybrid_gat_xg.meta.json",
     # Global temperature scalars
     "pool_7comp_T.pt",
     "pool_7comp_gat_T.pt",
@@ -55,7 +61,17 @@ UPLOAD_FILES = [
     "statsbomb_weuro2025_shot_graphs.pt",
     # Optional pre-computed artefacts
     "feature_importance.json",
+    # Data manifest (see scripts/build_manifest.py)
+    "MANIFEST.json",
 ]
+
+# Checkpoint/sidecar pairings — enforced before upload so you don't ship a
+# model weights file without its companion metadata. `None` means "no sidecar
+# expected" (e.g. shot graphs, temperature scalars).
+REQUIRED_SIDECARS: dict[str, str | None] = {
+    "pool_7comp_hybrid_xg.pt":      "pool_7comp_hybrid_xg.meta.json",
+    "pool_7comp_hybrid_gat_xg.pt":  "pool_7comp_hybrid_gat_xg.meta.json",
+}
 
 
 def parse_args():
@@ -91,6 +107,26 @@ def main():
         print(f"Warning: {len(missing)} file(s) not found and will be skipped:")
         for m in missing:
             print(f"  {m}")
+
+    # ── Refuse to upload a checkpoint without its metadata sidecar ──────────
+    # This is the training↔serving contract gate. Shipping a .pt without its
+    # .meta.json leaves the serving layer with no feature-schema declaration
+    # and app.py will refuse to load it at startup. Fail here instead of at
+    # deploy time.
+    uploaded_names = {p.name for p in to_upload}
+    contract_errors = []
+    for ckpt_name, sidecar_name in REQUIRED_SIDECARS.items():
+        if ckpt_name in uploaded_names and sidecar_name not in uploaded_names:
+            contract_errors.append(
+                f"{ckpt_name} present but {sidecar_name} missing. "
+                f"Run scripts/backfill_metadata.py or retrain."
+            )
+    if contract_errors:
+        print("\nERROR: metadata-sidecar contract violations:")
+        for err in contract_errors:
+            print(f"  - {err}")
+        print("Upload aborted. Fix the sidecars and try again.")
+        sys.exit(2)
 
     if not to_upload:
         print("No files to upload. Run train_xg_hybrid.py first.")

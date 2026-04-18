@@ -209,48 +209,21 @@ class TemperatureScaler(nn.Module):
 
 def _default_meta(batch, device: str) -> torch.Tensor:
     """
-    Build the standard 27-dim metadata tensor for HybridXGModel / HybridGATModel.
-    Mirrors _metadata_tensor() in train_xg_hybrid.py.
+    Build the canonical 27-dim metadata tensor for HybridXGModel / HybridGATModel.
 
-    Layout:
+    Delegates to `src.features.build_meta`, which is the **single** canonical
+    implementation across training, calibration, and serving. Missing graph
+    attributes raise `GraphSchemaMismatch` rather than silently imputing
+    defaults — see `src/features.py` for rationale.
+
+    Layout (v3-psxg, 27 dims):
       [0:4]   shot_dist, shot_angle, is_header, is_open_play
       [4:12]  technique (8-dim one-hot)
       [12:15] gk_dist, n_def_in_cone, gk_off_centre
       [15:18] gk_perp_offset, n_def_direct_line, is_right_foot
       [18:27] shot_placement (9-dim one-hot, PSxG goal-face zone)
-
-    Uses safe fallbacks so old 18-dim graphs still work with newer models.
     """
-    n = batch.shot_dist.shape[0]
-
-    base = torch.stack([
-        batch.shot_dist.squeeze(),
-        batch.shot_angle.squeeze(),
-        batch.is_header.squeeze().float(),
-        batch.is_open_play.squeeze().float(),
-    ], dim=1)                              # [n, 4]
-    tech = batch.technique.view(-1, 8)    # [n, 8]
-    gk   = torch.stack([
-        batch.gk_dist.squeeze(),
-        batch.n_def_in_cone.squeeze(),
-        batch.gk_off_centre.squeeze(),
-    ], dim=1)                              # [n, 3]
-
-    def _safe(attr, default):
-        if hasattr(batch, attr):
-            return getattr(batch, attr).squeeze()
-        return torch.full((n,), default)
-
-    new = torch.stack([
-        _safe("gk_perp_offset",    3.0),
-        _safe("n_def_direct_line", 0.0),
-        _safe("is_right_foot",     0.5),
-    ], dim=1)                              # [n, 3]
-
-    # PSxG placement: safe fallback → all-zeros (unknown zone) for old graphs
-    if hasattr(batch, "shot_placement"):
-        plc = batch.shot_placement.view(-1, 9)   # [n, 9]
-    else:
-        plc = torch.zeros(n, 9)                  # [n, 9] — zone 0 (unknown)
-
-    return torch.cat([base, tech, gk, new, plc], dim=1).to(device)  # [n, 27]
+    # Lazy import to avoid pulling `features` at module-load in contexts that
+    # only need the TemperatureScaler class (e.g. unit tests of the scaler).
+    from src.features import build_meta
+    return build_meta(batch).to(device)

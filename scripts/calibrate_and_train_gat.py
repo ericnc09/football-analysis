@@ -36,9 +36,12 @@ from torch_geometric.loader import DataLoader
 from sklearn.metrics import roc_auc_score, brier_score_loss
 
 from src.models.hybrid_gat import HybridGATModel
+from src.models.hybrid_gcn import HybridXGModel
 from src.calibration import TemperatureScaler
+from src.reproducibility import RunLogger, set_seed
 
 PROCESSED_DIR = REPO_ROOT / "data" / "processed"
+RESULTS_DIR   = REPO_ROOT / "results"
 SEED   = 42
 DEVICE = torch.device("cpu")
 EPOCHS = 120
@@ -47,33 +50,16 @@ LR     = 1e-3
 WD     = 1e-4
 META_DIM = 15   # dist, angle, header, open_play + technique×8 + gk_dist, n_def_in_cone, gk_off_centre
 
-torch.manual_seed(SEED)
-np.random.seed(SEED)
-random.seed(SEED)
+# One call seeds python/numpy/torch/cuDNN deterministically. See
+# src/reproducibility.py. Return value is stashed into the run log.
+_SEED_INFO = set_seed(SEED)
 
 
-# ── HybridXGModel (mirrors train_xg_hybrid.py) ───────────────────────────────
-class HybridXGModel(nn.Module):
-    def __init__(self, in_channels=9, hidden_dim=64, meta_dim=META_DIM, dropout=0.3):
-        super().__init__()
-        self.convs = nn.ModuleList([
-            GCNConv(in_channels, hidden_dim),
-            GCNConv(hidden_dim,  hidden_dim),
-            GCNConv(hidden_dim,  hidden_dim),
-        ])
-        self.dropout = dropout
-        self.head = nn.Sequential(
-            nn.Linear(hidden_dim + meta_dim, hidden_dim),
-            nn.ReLU(), nn.Dropout(dropout), nn.Linear(hidden_dim, 1),
-        )
-
-    def encode(self, x, edge_index, batch):
-        for conv in self.convs:
-            x = F.dropout(F.relu(conv(x, edge_index)), p=self.dropout, training=self.training)
-        return global_mean_pool(x, batch)
-
-    def forward(self, x, edge_index, batch, metadata):
-        return self.head(torch.cat([self.encode(x, edge_index, batch), metadata], dim=1))
+# ── HybridXGModel is imported from src.models.hybrid_gcn above ───────────────
+# The inline redefinition that used to live here drifted against
+# `scripts/train_xg_hybrid.py` (different default META_DIM) — the canonical
+# class now lives in a single module so the GAT-calibration path loads the
+# same architecture that produced the checkpoint.
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -254,6 +240,36 @@ def main():
           f"(Δ={brier_te - brier_gat_cal:+.4f})")
 
     scaler_gat.save(PROCESSED_DIR / "pool_7comp_gat_T.pt")
+
+    # ── Experiment log ────────────────────────────────────────────────────────
+    # Append a machine-readable record of this run so results/runs.jsonl is
+    # queryable six months from now. See src/reproducibility.py.
+    try:
+        RunLogger(RESULTS_DIR / "runs.jsonl").log(
+            script="scripts/calibrate_and_train_gat.py",
+            config={
+                "seed":          SEED,
+                "seed_info":     _SEED_INFO,
+                "epochs":        EPOCHS,
+                "batch_size":    BATCH,
+                "lr":            LR,
+                "weight_decay":  WD,
+                "meta_dim":      META_DIM,
+                "pool_inputs":   [str(p) for p in paths],
+                "n_splits":      {"train": len(train_g), "val": len(val_g), "test": len(test_g)},
+            },
+            metrics={
+                "hybrid_gat.val_auc":       float(best_auc),
+                "hybrid_gat.test_auc":      float(auc_te),
+                "hybrid_gat.test_brier":    float(brier_te),
+                "hybrid_gat_T.test_auc":    float(auc_gat_cal),
+                "hybrid_gat_T.test_brier":  float(brier_gat_cal),
+                "hybrid_gat_T.temperature": float(T_gat),
+            },
+            model_path=str(gat_weights_path),
+        )
+    except Exception as _log_err:  # noqa: BLE001 — never kill a successful run
+        print(f"  WARNING: failed to write run log: {_log_err}")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print("\n" + "=" * 64)

@@ -1,0 +1,46 @@
+# Pre-commit config — run the cheap slice of CI locally before `git commit`.
+#
+# Install once:
+#   pip install pre-commit && pre-commit install
+#
+# Then every `git commit` runs the hooks below on staged files. CI re-runs
+# the same checks on the whole tree, so local hook failures always reproduce.
+
+repos:
+  # Generic sanity checks — newline at EOF, no stray large files, etc.
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+        args: ['--maxkb=5000']   # model .pt files should go to HF Hub, not git
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+
+  # Ruff — fast linter + import sorter, matches the CI config.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  # Black — formatting check (advisory until the codebase is fully formatted).
+  - repo: https://github.com/psf/black
+    rev: 24.10.0
+    hooks:
+      - id: black
+        language_version: python3.11
+
+  # Catch Python syntax errors that ruff config might skip (e.g. scripts/).
+  - repo: local
+    hooks:
+      - id: ast-parse-all
+        name: "AST parse all .py files"
+        entry: python -c "import ast,pathlib,sys; [ast.parse(p.read_text()) for p in pathlib.Path('.').rglob('*.py') if not set(p.parts)&{'.venv','venv','build','dist'}]"
+        language: system
+        pass_filenames: false
+        always_run: true

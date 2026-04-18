@@ -1,7 +1,28 @@
 """
 features.py
 -----------
-Enriches PyG Data objects with additional node and edge features.
+Enriches PyG Data objects with additional node and edge features, AND owns
+the single canonical implementation of `build_meta()` — the shot-metadata
+tensor consumed by the hybrid model's MLP head.
+
+Why `build_meta()` lives here
+-----------------------------
+Historically, two near-identical implementations coexisted:
+  - `app.py::_build_meta`         (serving)
+  - `src/calibration.py::_default_meta` (calibration)
+  - (implicit third copy via ad-hoc tensors in compute_node_saliency and
+    compute_gat_attention inside app.py)
+
+They drifted silently because each imputed plausible defaults (`is_right_foot
+= 0.5`, `gk_perp_offset = 3.0`) for missing attributes. The ML review flagged
+this as a "silent wrong prediction" bug: a newer `meta_dim=27` model served
+against older graphs gave sensible-looking but wrong outputs with no warning.
+
+This module now hosts the canonical `build_meta(batch, schema_version)`. It
+validates that every required attribute exists on the batch and **raises** on
+missing attributes rather than fabricating a default. The loader (app.py)
+calls `assert_graph_schema_compatible()` at startup against every graph file
+so failure happens at service-start, not mid-inference.
 
 Node features added on top of graph_builder output:
   - distance to each goal (attacking, defending)
@@ -13,12 +34,17 @@ Edge features added on top of graph_builder output:
   - pass angle (direction of edge relative to goal)
   - velocity alignment (dot product of velocities if tracking data)
 
-Main entry point: enrich_graph()
+Public API:
+  - enrich_graph()                      — add node/edge features to a Data
+  - encode_technique() / encode_placement() — one-hot helpers
+  - build_meta(batch, schema)           — canonical metadata tensor builder
+  - assert_graph_schema_compatible()    — startup-time contract check
+  - GraphSchemaMismatch                 — raised on missing attributes
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Iterable, Optional
 
 import numpy as np
 import torch
@@ -286,3 +312,203 @@ def enrich_graph(
     data.edge_attr = torch.tensor(np.hstack(new_edge_feats), dtype=torch.float)
 
     return data
+
+
+# ---------------------------------------------------------------------------
+# Canonical shot-metadata tensor builder
+# ---------------------------------------------------------------------------
+#
+# `build_meta()` is the single implementation of the metadata tensor that the
+# hybrid model's MLP head consumes. Historically three near-duplicate copies
+# existed (`app.py::_build_meta`, `src/calibration.py::_default_meta`, and
+# ad-hoc tensors in `compute_node_saliency` / `compute_gat_attention`). They
+# drifted silently because each imputed plausible defaults for missing
+# attributes (`is_right_foot=0.5`, `gk_perp_offset=3.0`, `shot_placement=0`).
+#
+# The ML review flagged this as a *silent wrong prediction* class of bug: a
+# newer `meta_dim=27` model served against older graphs gave sensible-looking
+# but **wrong** outputs with no warning.
+#
+# This implementation inverts that design: missing attributes are a
+# **hard error**, not a defaultable field. The caller is responsible for
+# ensuring the graphs loaded on disk match the feature_schema_version
+# recorded in the model's `.meta.json` sidecar.
+# ---------------------------------------------------------------------------
+
+class GraphSchemaMismatch(RuntimeError):
+    """
+    Raised when a shot graph is missing one or more attributes that the
+    requested `feature_schema_version` requires. Fail loudly — the caller
+    should rebuild shot graphs with `scripts/build_shot_graphs.py` at a
+    matching schema, or retrain against the current graph schema.
+
+    This exception is the graph-side twin of
+    `src.model_metadata.FeatureSchemaMismatch`: one gates the model, the
+    other gates the inputs fed into it.
+    """
+
+
+# Required PyG `Data` / `Batch` attribute names per schema version.
+# Must stay lock-stepped with `KNOWN_SCHEMAS` in `src/model_metadata.py`.
+#
+# These are the attributes `build_meta()` reads off each graph. A graph
+# can have MORE attributes than required (e.g. home_team, sb_xg, match_id)
+# without triggering the check — only MISSING ones are a contract break.
+REQUIRED_ATTRS_PER_SCHEMA: dict[str, tuple[str, ...]] = {
+    # 12-dim: base (4) + technique one-hot (8)
+    "v1-base": (
+        "shot_dist", "shot_angle", "is_header", "is_open_play",
+        "technique",
+    ),
+    # 18-dim: v1-base + gk_original (3) + gk_precision (3)
+    "v2-gk": (
+        "shot_dist", "shot_angle", "is_header", "is_open_play",
+        "technique",
+        "gk_dist", "n_def_in_cone", "gk_off_centre",
+        "gk_perp_offset", "n_def_direct_line", "is_right_foot",
+    ),
+    # 27-dim: v2-gk + shot_placement one-hot (9)
+    "v3-psxg": (
+        "shot_dist", "shot_angle", "is_header", "is_open_play",
+        "technique",
+        "gk_dist", "n_def_in_cone", "gk_off_centre",
+        "gk_perp_offset", "n_def_direct_line", "is_right_foot",
+        "shot_placement",
+    ),
+}
+
+
+def _require(batch, attr: str, schema_version: str) -> torch.Tensor:
+    """
+    Fetch `batch.<attr>` or raise `GraphSchemaMismatch` with a message that
+    tells the operator exactly what to do. No silent fallbacks.
+    """
+    if not hasattr(batch, attr):
+        raise GraphSchemaMismatch(
+            f"Shot graph is missing required attribute {attr!r} for "
+            f"feature_schema_version={schema_version!r}. Either (a) rebuild "
+            f"the graphs with scripts/build_shot_graphs.py at a matching "
+            f"schema, or (b) serve an older model whose sidecar declares a "
+            f"schema that does not require {attr!r}. Do NOT impute defaults — "
+            f"silent padding produced the v2→v3 wrong-prediction bug that "
+            f"this gate exists to prevent."
+        )
+    return getattr(batch, attr)
+
+
+def build_meta(batch, schema_version: str | None = None) -> torch.Tensor:
+    """
+    Build the canonical metadata tensor for a PyG `Data` / `Batch` of shots.
+
+    Parameters
+    ----------
+    batch : torch_geometric.data.Data | Batch
+        Must carry every attribute listed in
+        `REQUIRED_ATTRS_PER_SCHEMA[schema_version]`. Missing attributes
+        raise `GraphSchemaMismatch` — there are no defaults.
+    schema_version : str, optional
+        One of the keys in `REQUIRED_ATTRS_PER_SCHEMA`. Defaults to
+        `model_metadata.CURRENT_FEATURE_SCHEMA_VERSION`. Callers that load
+        a model should pass `model._model_meta.feature_schema_version` so
+        the meta tensor is built for exactly that model's contract.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape `[N, meta_dim]` where `meta_dim` is
+        12 for `v1-base`, 18 for `v2-gk`, 27 for `v3-psxg`.
+
+    Raises
+    ------
+    GraphSchemaMismatch
+        On any missing required attribute OR an unknown `schema_version`.
+    """
+    # Lazy-import to avoid a circular import at module load time —
+    # `model_metadata` doesn't depend on this module but we want the
+    # default to track CURRENT_FEATURE_SCHEMA_VERSION without forcing
+    # every importer of `features` to pay for it.
+    if schema_version is None:
+        from src.model_metadata import CURRENT_FEATURE_SCHEMA_VERSION
+        schema_version = CURRENT_FEATURE_SCHEMA_VERSION
+
+    if schema_version not in REQUIRED_ATTRS_PER_SCHEMA:
+        raise GraphSchemaMismatch(
+            f"Unknown feature_schema_version={schema_version!r}. "
+            f"Known: {list(REQUIRED_ATTRS_PER_SCHEMA.keys())}. Add a new "
+            f"entry to REQUIRED_ATTRS_PER_SCHEMA and KNOWN_SCHEMAS if "
+            f"this is a new schema; otherwise check for a typo."
+        )
+
+    # ── v1-base components (12 dims) ─────────────────────────────────────────
+    base = torch.stack([
+        _require(batch, "shot_dist",    schema_version).squeeze(),
+        _require(batch, "shot_angle",   schema_version).squeeze(),
+        _require(batch, "is_header",    schema_version).squeeze().float(),
+        _require(batch, "is_open_play", schema_version).squeeze().float(),
+    ], dim=1)                                              # [N, 4]
+    tech = _require(batch, "technique", schema_version).view(-1, 8)   # [N, 8]
+
+    if schema_version == "v1-base":
+        return torch.cat([base, tech], dim=1)              # [N, 12]
+
+    # ── v2-gk extras (+6 → 18 dims) ──────────────────────────────────────────
+    gk = torch.stack([
+        _require(batch, "gk_dist",        schema_version).squeeze(),
+        _require(batch, "n_def_in_cone",  schema_version).squeeze(),
+        _require(batch, "gk_off_centre",  schema_version).squeeze(),
+    ], dim=1)                                              # [N, 3]
+    gk_prec = torch.stack([
+        _require(batch, "gk_perp_offset",    schema_version).squeeze(),
+        _require(batch, "n_def_direct_line", schema_version).squeeze(),
+        _require(batch, "is_right_foot",     schema_version).squeeze(),
+    ], dim=1)                                              # [N, 3]
+
+    if schema_version == "v2-gk":
+        return torch.cat([base, tech, gk, gk_prec], dim=1)  # [N, 18]
+
+    # ── v3-psxg extras (+9 → 27 dims) ────────────────────────────────────────
+    placement = _require(batch, "shot_placement", schema_version).view(-1, 9)
+
+    return torch.cat([base, tech, gk, gk_prec, placement], dim=1)   # [N, 27]
+
+
+def assert_graph_schema_compatible(
+    graphs: Iterable,
+    schema_version: str,
+    *,
+    source_name: str = "<unknown>",
+) -> None:
+    """
+    Walk `graphs` and raise `GraphSchemaMismatch` on the first one that
+    doesn't satisfy the attribute contract for `schema_version`.
+
+    Intended for startup-time validation (e.g. right after loading a
+    shot-graph file and before running inference), so failures happen
+    deterministically at service-start instead of mid-prediction.
+
+    Parameters
+    ----------
+    graphs : Iterable of PyG `Data` objects
+    schema_version : "v1-base" | "v2-gk" | "v3-psxg"
+    source_name : human-readable identifier of the graph source
+        (filename, competition key, etc.) — appears in error messages so
+        the operator knows which artefact is stale.
+    """
+    if schema_version not in REQUIRED_ATTRS_PER_SCHEMA:
+        raise GraphSchemaMismatch(
+            f"Unknown feature_schema_version={schema_version!r}. "
+            f"Known: {list(REQUIRED_ATTRS_PER_SCHEMA.keys())}."
+        )
+
+    required = REQUIRED_ATTRS_PER_SCHEMA[schema_version]
+    for idx, g in enumerate(graphs):
+        missing = [a for a in required if not hasattr(g, a)]
+        if missing:
+            raise GraphSchemaMismatch(
+                f"Graph source {source_name!r} is not compatible with "
+                f"feature_schema_version={schema_version!r}. Graph #{idx} "
+                f"is missing attribute(s): {missing}. "
+                f"Rebuild with scripts/build_shot_graphs.py at a matching "
+                f"schema, or load a model whose sidecar declares an older "
+                f"schema."
+            )

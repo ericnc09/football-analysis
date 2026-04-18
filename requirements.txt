@@ -1,7 +1,15 @@
-# Core ML — torch + torch-geometric installed separately in Dockerfile
-# (needs version-pinned CPU wheel URLs; see Dockerfile)
-# For local dev: pip install torch==2.10.0 torch-geometric==2.7.0
+# ─── Core ML ────────────────────────────────────────────────────────────────
+# torch + torch-geometric are installed separately in the Dockerfile because
+# they require version-pinned CPU wheels with custom index URLs.
+# For local dev:
+#   pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
+#   pip install torch-geometric==2.7.0 torch-scatter torch-sparse \
+#       -f https://data.pyg.org/whl/torch-2.7.0+cpu.html
 
+# ─── Pinned app dependencies ────────────────────────────────────────────────
+# All pins are exact-version (==) so the Docker build and any fresh checkout
+# resolve to identical bytes. For transitive-dependency locking, use the
+# adjacent requirements-locked.txt (generated via `pip freeze > ...`).
 matplotlib==3.10.8
 mplsoccer==1.6.1
 numpy==2.4.3
@@ -9,9 +17,12 @@ pandas==2.3.3
 requests==2.32.5
 requests-cache==1.3.1
 scikit-learn==1.8.0
-xgboost>=3.0.0
+xgboost==3.0.0
 scipy==1.17.1
 seaborn==0.13.2
 statsbombpy==1.17.0
 streamlit==1.55.0
-huggingface-hub>=0.24.0
+huggingface-hub>=0.24.0,<1.0.0
+
+# ─── Dev / test (optional — install with `pip install -r requirements-dev.txt`)
+# Listed here for convenience; pinned in requirements-dev.txt

@@ -57,65 +57,45 @@ from src.models.gcn import FootballGCN
 from src.models.gat import FootballGAT
 from src.models.hybrid_gat import HybridGATModel
 from src.calibration import TemperatureScaler
+from src.model_metadata import (
+    ModelMetadata,
+    save_sidecar,
+    CURRENT_FEATURE_SCHEMA_VERSION,
+)
+from src.reproducibility import RunLogger, set_seed
 
 PROCESSED_DIR = REPO_ROOT / "data" / "processed"
+RESULTS_DIR   = REPO_ROOT / "results"
 SEED = 42
-torch.manual_seed(SEED)
-np.random.seed(SEED)
-random.seed(SEED)
+# Single call replaces the scattered torch/np/random seeds. `set_seed` also
+# pins PYTHONHASHSEED + cuDNN deterministic mode so reruns are bit-identical.
+# Returns a dict summarising what was seeded (stashed into the run log below).
+_SEED_INFO = set_seed(SEED)
 DEVICE = torch.device("cpu")
 
-EPOCHS = 120
-BATCH  = 64
-LR     = 1e-3
-WD     = 1e-4
-META_DIM = 27  # shot_dist, shot_angle, is_header, is_open_play + technique×8
-               # + gk_dist, n_def_in_cone, gk_off_centre          (original 3)
-               # + gk_perp_offset, n_def_direct_line, is_right_foot (precision 3)
-               # + shot_placement×9 (PSxG goal-face zone, one-hot)
+EPOCHS   = 120
+BATCH    = 64
+LR       = 1e-3
+WD       = 1e-4
+HIDDEN   = 64    # GCN hidden / HybridGCN encoder width
+GAT_HIDDEN = 32  # HybridGAT uses a narrower width with more attention heads
+HEADS    = 4     # HybridGAT attention heads
+DROPOUT  = 0.3   # shared across encoder + MLP head
+META_DIM = 27    # shot_dist, shot_angle, is_header, is_open_play + technique×8
+                 # + gk_dist, n_def_in_cone, gk_off_centre          (original 3)
+                 # + gk_perp_offset, n_def_direct_line, is_right_foot (precision 3)
+                 # + shot_placement×9 (PSxG goal-face zone, one-hot)
 
 
 # ---------------------------------------------------------------------------
 # Hybrid model: GCN encoder  +  metadata MLP head
 # ---------------------------------------------------------------------------
+# Canonical class lives in `src/models/hybrid_gcn.py`. This script used to
+# redefine it inline, which drifted: the app.py copy used `meta_dim=15` while
+# this one used `META_DIM=27`, and `load_state_dict` matches by *name* so the
+# mismatch would fail on every deploy. Single source of truth now.
 
-class HybridXGModel(nn.Module):
-    """
-    GCN that produces a graph-level embedding, then concatenates it with
-    12 hand-crafted shot features before a small MLP head.
-
-    GCN path : node features → 3× GCNConv → global_mean_pool → hidden_dim
-    Meta path : [dist, angle, header, open_play, technique×8]
-    Head      : Linear(hidden + meta, hidden) → ReLU → Dropout → Linear(→ 1)
-    """
-
-    def __init__(self, in_channels: int, hidden_dim: int = 64,
-                 meta_dim: int = META_DIM, dropout: float = 0.3):
-        super().__init__()
-        self.convs = nn.ModuleList([
-            GCNConv(in_channels,  hidden_dim),
-            GCNConv(hidden_dim,   hidden_dim),
-            GCNConv(hidden_dim,   hidden_dim),
-        ])
-        self.dropout = dropout
-        self.head = nn.Sequential(
-            nn.Linear(hidden_dim + meta_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def encode(self, x, edge_index, batch):
-        """Return graph-level embedding before the MLP head."""
-        for conv in self.convs:
-            x = F.dropout(F.relu(conv(x, edge_index)),
-                          p=self.dropout, training=self.training)
-        return global_mean_pool(x, batch)          # [n_graphs, hidden_dim]
-
-    def forward(self, x, edge_index, batch, metadata, edge_attr=None):
-        emb = self.encode(x, edge_index, batch)    # [n_graphs, hidden_dim]
-        combined = torch.cat([emb, metadata], dim=1)
-        return self.head(combined)                 # [n_graphs, 1]
+from src.models.hybrid_gcn import HybridXGModel  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -384,8 +364,8 @@ def _fit_per_comp_T(model, val_g: list, label: str) -> dict:
 
 
 def train_hybrid(train_g, val_g, in_channels, pos_weight):
-    model = HybridXGModel(in_channels=in_channels, hidden_dim=64,
-                          meta_dim=META_DIM, dropout=0.3).to(DEVICE)
+    model = HybridXGModel(in_channels=in_channels, hidden_dim=HIDDEN,
+                          meta_dim=META_DIM, dropout=DROPOUT).to(DEVICE)
     n = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"     HybridGCN: {n:,} params")
     opt   = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WD)
@@ -411,7 +391,8 @@ def train_hybrid_gat(train_g, val_g, in_channels, edge_channels, pos_weight):
     """Train HybridGATModel — identical loop to train_hybrid but uses GATv2Conv."""
     model = HybridGATModel(
         node_in=in_channels, edge_dim=edge_channels,
-        meta_dim=META_DIM, hidden=32, heads=4, n_layers=3, dropout=0.3,
+        meta_dim=META_DIM, hidden=GAT_HIDDEN, heads=HEADS, n_layers=3,
+        dropout=DROPOUT,
     ).to(DEVICE)
     n = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"     HybridGAT: {n:,} params")
@@ -512,10 +493,57 @@ def run_experiment(name, train_g, val_g, test_g):
     out = PROCESSED_DIR
     torch.save(gcn.state_dict(),         out / f"{name}_gcn_xg.pt")
     torch.save(gat.state_dict(),         out / f"{name}_gat_xg.pt")
-    torch.save(hybrid.state_dict(),      out / "pool_7comp_hybrid_xg.pt")       # canonical GCN path
-    torch.save(hybrid_gat.state_dict(),  out / "pool_7comp_hybrid_gat_xg.pt")   # canonical GAT path
+
+    hybrid_ckpt     = out / "pool_7comp_hybrid_xg.pt"
+    hybrid_gat_ckpt = out / "pool_7comp_hybrid_gat_xg.pt"
+    torch.save(hybrid.state_dict(),      hybrid_ckpt)       # canonical GCN path
+    torch.save(hybrid_gat.state_dict(),  hybrid_gat_ckpt)   # canonical GAT path
     scaler.save(    out / "pool_7comp_T.pt")       # GCN global temperature
     scaler_gat.save(out / "pool_7comp_gat_T.pt")   # GAT global temperature
+
+    # ── Metadata sidecars (training↔serving contract) ────────────────────────
+    # See src/model_metadata.py docstring for why these exist. Without them,
+    # app.py has to reverse-engineer meta_dim from head.0.weight shape, which
+    # is silent-wrong if feature schema drifts. Writing them at save time is
+    # the cheapest place to enforce the contract.
+    hybrid_brier = float(cal_result.get("brier_after", float("nan")))
+    hybrid_gat_brier = float(cal_gat.get("brier_after", float("nan")))
+    try:
+        gcn_node_in  = int(train_g[0].x.shape[1])
+        gcn_edge_dim = int(train_g[0].edge_attr.shape[1]) \
+            if train_g[0].edge_attr is not None else 0
+
+        save_sidecar(
+            ModelMetadata.from_hybrid_xg(
+                hybrid,
+                node_in=gcn_node_in,
+                edge_dim=0,                  # HybridXGModel ignores edge_attr
+                trained_on=name,
+                val_auc=float(results["HybridGCN+T"]["auc"]),
+                val_brier=hybrid_brier,
+                temperature_global=float(T_val),
+                temperature_per_competition={k: float(v) for k, v in per_comp_T_gcn.items()},
+            ),
+            hybrid_ckpt,
+        )
+        save_sidecar(
+            ModelMetadata.from_hybrid_gat(
+                hybrid_gat,
+                node_in=gcn_node_in,
+                edge_dim=gcn_edge_dim,
+                trained_on=name,
+                val_auc=float(results["HybridGAT+T"]["auc"]),
+                val_brier=hybrid_gat_brier,
+                temperature_global=float(T_gat),
+                temperature_per_competition={k: float(v) for k, v in per_comp_T_gat.items()},
+            ),
+            hybrid_gat_ckpt,
+        )
+        print(f"  Metadata sidecars written "
+              f"(schema={CURRENT_FEATURE_SCHEMA_VERSION}) → "
+              f"{hybrid_ckpt.stem}.meta.json, {hybrid_gat_ckpt.stem}.meta.json")
+    except Exception as _sidecar_err:  # noqa: BLE001 — log, don't block training
+        print(f"  WARNING: failed to write metadata sidecars: {_sidecar_err}")
 
     # Per-competition temperature (one T per competition label)
     per_comp_T_gcn = _fit_per_comp_T(hybrid,     val_g, f"HybridGCN ({name})")
@@ -647,19 +675,117 @@ def run_experiment(name, train_g, val_g, test_g):
 # CLI
 # ---------------------------------------------------------------------------
 
+def _load_yaml_config(path: Path) -> dict:
+    """Load a YAML config file into a dict. Used as argparse defaults.
+
+    Keeping this a pure load-then-merge (rather than framework magic like Hydra)
+    keeps the script debuggable — `--config foo.yaml --lr 3e-4` is "load YAML,
+    then override lr". No side effects, no search paths.
+    """
+    try:
+        import yaml  # noqa: WPS433 — optional dep
+    except ImportError as e:
+        raise SystemExit(
+            "--config requires PyYAML. Install with `pip install pyyaml` "
+            "or pass hyperparameters via CLI flags instead."
+        ) from e
+    with path.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    if not isinstance(cfg, dict):
+        raise SystemExit(f"Config file {path} must be a YAML mapping, got {type(cfg)}")
+    # Ignore unknown keys — argparse will silently pass them through via
+    # set_defaults, which ArgumentParser tolerates. Flag genuinely-unknown
+    # keys so typos don't vanish.
+    known = {
+        "data", "train", "test", "seed", "epochs", "batch_size", "lr",
+        "weight_decay", "hidden", "gat_hidden", "heads", "dropout",
+    }
+    unknown = set(cfg) - known
+    if unknown:
+        print(f"WARNING: ignoring unknown keys in {path}: {sorted(unknown)}",
+              file=sys.stderr)
+    return {k: v for k, v in cfg.items() if k in known}
+
+
+def _override_globals_from_args(args: argparse.Namespace) -> None:
+    """Copy CLI-resolved hyperparameters into module globals.
+
+    The training helpers (`train_hybrid`, `train_hybrid_gat`, `_fit_per_comp_T`,
+    the _log_run record, the LogReg `random_state`, etc.) all read from module-
+    level constants rather than accepting hyperparams via thread-through kwargs.
+    Rewriting every call site would be a large blast radius for zero behavioural
+    win — so instead we rebind the module globals at main() entry, which is the
+    only place hyperparams can change. Callers that import this as a library
+    should call `set_seed(...)` and rebind globals themselves.
+    """
+    g = globals()
+    g["SEED"]       = args.seed
+    g["EPOCHS"]     = args.epochs
+    g["BATCH"]      = args.batch_size
+    g["LR"]         = args.lr
+    g["WD"]         = args.weight_decay
+    g["HIDDEN"]     = args.hidden
+    g["GAT_HIDDEN"] = args.gat_hidden
+    g["HEADS"]      = args.heads
+    g["DROPOUT"]    = args.dropout
+    # Re-seed now that SEED has potentially changed — the module-level
+    # set_seed() call happened at import time with the default of 42.
+    g["_SEED_INFO"] = set_seed(args.seed)
+
+
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="xG Benchmark — GCN / GAT / HybridGCN / HybridGAT",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    # ── Data selection ─────────────────────────────────────────────────
     parser.add_argument("--data",  nargs="+", type=Path, default=None,
                         help="One or more .pt shot graph files to pool (in-competition mode)")
     parser.add_argument("--train", nargs="+", type=Path, default=None,
                         help="Training .pt files (cross-competition mode)")
     parser.add_argument("--test",  nargs="+", type=Path, default=None,
                         help="Test .pt files (cross-competition mode)")
+
+    # ── Hyperparameters ────────────────────────────────────────────────
+    # Defaults mirror the module-level constants so `python train_xg_hybrid.py`
+    # with no flags produces the same run as before the CLI surface was added.
+    parser.add_argument("--seed",         type=int,   default=SEED,       help="RNG seed")
+    parser.add_argument("--epochs",       type=int,   default=EPOCHS,     help="Training epochs")
+    parser.add_argument("--batch-size",   type=int,   default=BATCH,      help="Mini-batch size",
+                        dest="batch_size")
+    parser.add_argument("--lr",           type=float, default=LR,         help="Learning rate")
+    parser.add_argument("--weight-decay", type=float, default=WD,         help="AdamW weight decay",
+                        dest="weight_decay")
+    parser.add_argument("--hidden",       type=int,   default=HIDDEN,     help="HybridGCN hidden width")
+    parser.add_argument("--gat-hidden",   type=int,   default=GAT_HIDDEN, help="HybridGAT hidden width",
+                        dest="gat_hidden")
+    parser.add_argument("--heads",        type=int,   default=HEADS,      help="HybridGAT attention heads")
+    parser.add_argument("--dropout",      type=float, default=DROPOUT,    help="Dropout (encoder + head)")
+
+    # ── Config file ────────────────────────────────────────────────────
+    # Precedence: CLI flag > YAML value > built-in default. We parse the
+    # --config flag alone first, load the YAML, and feed its values into the
+    # main parser as defaults — which lets any *explicit* CLI flag override.
+    parser.add_argument("--config", type=Path, default=None,
+                        help="YAML config file with hyperparameters (CLI flags still override)")
+
+    # Two-phase parse so --config's values become defaults for a re-parse.
+    pre_args, _ = parser.parse_known_args()
+    if pre_args.config:
+        overrides = _load_yaml_config(pre_args.config)
+        if overrides:
+            print(f"[config] loaded {len(overrides)} overrides from {pre_args.config}:"
+                  f"  {overrides}")
+            parser.set_defaults(**overrides)
+
     args = parser.parse_args()
+    _override_globals_from_args(args)
 
     print("=" * 72)
     print("xG Benchmark — GCN / GAT / HybridGCN vs StatsBomb vs LogReg")
     print("=" * 72)
+    print(f"[config] seed={SEED} epochs={EPOCHS} batch={BATCH} lr={LR} wd={WD}")
+    print(f"[config] hidden={HIDDEN} gat_hidden={GAT_HIDDEN} heads={HEADS} dropout={DROPOUT}")
 
     if args.train and args.test:
         # ── Cross-competition ──────────────────────────────────────────────
@@ -676,7 +802,14 @@ def main():
         train_stems = "+".join(p.stem[:8] for p in args.train)
         test_stems  = "+".join(p.stem[:8] for p in args.test)
         name = f"cross_{train_stems}_to_{test_stems}"[:60]
-        run_experiment(name, train_g, val_g, test_g)
+        results = run_experiment(name, train_g, val_g, test_g)
+        _log_run(
+            script="scripts/train_xg_hybrid.py",
+            name=name,
+            results=results,
+            n_splits={"train": len(train_g), "val": len(val_g), "test": len(test_g)},
+            pool_inputs=[str(p) for p in (args.train + args.test)],
+        )
 
     else:
         # ── Pooled in-competition ──────────────────────────────────────────
@@ -702,9 +835,63 @@ def main():
         stems = "_".join(p.stem.replace("statsbomb_","").replace("_shot_graphs","")
                          for p in paths)
         name = f"pool_{len(paths)}comp"
-        run_experiment(name, train_g, val_g, test_g)
+        results = run_experiment(name, train_g, val_g, test_g)
+
+        # ── Experiment log ────────────────────────────────────────────────
+        # Append a JSONL record so six months from now `jq` can recover the
+        # config behind any headline number. See src/reproducibility.py.
+        _log_run(
+            script="scripts/train_xg_hybrid.py",
+            name=name,
+            results=results,
+            n_splits={"train": len(train_g), "val": len(val_g), "test": len(test_g)},
+            pool_inputs=[str(p) for p in paths],
+        )
 
     print("\nDone.")
+
+
+def _log_run(
+    *,
+    script: str,
+    name: str,
+    results: dict,
+    n_splits: dict[str, int],
+    pool_inputs: list[str],
+) -> None:
+    """Append one entry to results/runs.jsonl with the full config + metrics."""
+    try:
+        logger = RunLogger(RESULTS_DIR / "runs.jsonl")
+        logger.log(
+            script=script,
+            config={
+                "run_name":         name,
+                "seed":             SEED,
+                "seed_info":        _SEED_INFO,
+                "epochs":           EPOCHS,
+                "batch_size":       BATCH,
+                "lr":               LR,
+                "weight_decay":     WD,
+                "hidden":           HIDDEN,
+                "gat_hidden":       GAT_HIDDEN,
+                "heads":            HEADS,
+                "dropout":          DROPOUT,
+                "meta_dim":         META_DIM,
+                "feature_schema":   CURRENT_FEATURE_SCHEMA_VERSION,
+                "pool_inputs":      pool_inputs,
+                "n_splits":         n_splits,
+            },
+            metrics={
+                # Flatten the (model, metric) dict so downstream jq queries are trivial.
+                f"{model}.{k}": float(v)
+                for model, row in (results or {}).items()
+                for k, v in row.items()
+                if isinstance(v, (int, float))
+            },
+            model_path=str(PROCESSED_DIR / "pool_7comp_hybrid_xg.pt"),
+        )
+    except Exception as _log_err:  # noqa: BLE001 — never kill a successful run
+        print(f"WARNING: failed to write run log: {_log_err}")
 
 
 if __name__ == "__main__":

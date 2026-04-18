@@ -1,0 +1,65 @@
+# ── Keep the Docker build context lean ──────────────────────────────────────
+# Without this file, `COPY . .` includes .venv/ (~2.5 GB), raw StatsBomb data
+# (hundreds of MB), git history, cached notebooks, etc. That balloons the
+# build context, blows out layer caches, and on HF Spaces can cause OOM
+# during build. Everything listed below is either rebuilt from source in the
+# container or downloaded at runtime from the HF Hub model repo.
+
+# ── Python environments ─────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ── Git & VCS ───────────────────────────────────────────────────────────────
+.git/
+.gitignore
+.gitattributes
+
+# ── IDE / editor / OS ───────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Test + build artefacts ──────────────────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Data: rebuilt at runtime from HF Hub ────────────────────────────────────
+data/raw/
+data/processed/
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# ── Notebooks / drafts / analysis artefacts ─────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+notebooks/
+figures/
+
+# ── Paper, reviews, and internal docs ───────────────────────────────────────
+paper/
+reviews/
+
+# ── Local secrets (should never be copied into image) ───────────────────────
+.env
+.env.*
+!.env.example
+
+# ── CI / deployment scaffolding not needed at runtime ───────────────────────
+.github/
+*.log
